@@ -49,6 +49,7 @@ from frigate.const import (
 from frigate.models import Event, Previews, Recordings, Regions, ReviewSegment
 from frigate.output.preview import get_most_recent_preview_frame
 from frigate.track.object_processing import TrackedObjectProcessor
+from frigate.util.cache_frame import get_latest_cache_frame
 from frigate.util.ffmpeg import terminate_ffmpeg_stream
 from frigate.util.file import (
     get_event_snapshot_bytes,
@@ -226,12 +227,26 @@ async def latest_frame(
         retry_interval = float(camera_config.ffmpeg.retry_interval or 10)
 
         is_offline = False
+        from_cache = False
         if frame is None or datetime.now().timestamp() > (
             frame_processor.get_current_frame_time(camera_name) + retry_interval
         ):
             last_frame_time = frame_processor.get_current_frame_time(camera_name)
-            preview_path = get_most_recent_preview_frame(
-                camera_name, before=last_frame_time
+
+            # in replay mode no detect stream is ever decoding, so the latest
+            # recording cache segment is fresher than any preview
+            if camera_config.enabled and camera_config.detect_replay:
+                frame = await asyncio.to_thread(
+                    get_latest_cache_frame,
+                    request.app.frigate_config.ffmpeg,
+                    camera_name,
+                )
+                from_cache = frame is not None
+
+            preview_path = (
+                None
+                if from_cache
+                else get_most_recent_preview_frame(camera_name, before=last_frame_time)
             )
 
             if preview_path:
@@ -241,7 +256,7 @@ async def latest_frame(
                 if frame is not None:
                     is_offline = True
 
-            if frame is None or not is_offline:
+            if frame is None or not (is_offline or from_cache):
                 logger.debug(
                     f"No live or preview frame available for {camera_name}. Using error image."
                 )
@@ -284,6 +299,9 @@ async def latest_frame(
 
         if is_offline:
             headers["X-Frigate-Offline"] = "true"
+
+        if from_cache:
+            headers["X-Frigate-Frame-Source"] = "recording-cache"
 
         return Response(
             content=img.tobytes(),

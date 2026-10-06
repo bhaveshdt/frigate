@@ -131,7 +131,7 @@ class CameraTracker(FrigateProcess):
         # empty the frame queue
         logger.info(f"{self.config.name}: emptying frame queue")
         while not frame_queue.empty():
-            (frame_name, _) = frame_queue.get(False)
+            frame_name = frame_queue.get(False)[0]
             frame_manager.delete(frame_name)
 
         logger.info(f"{self.config.name}: exiting subprocess")
@@ -277,14 +277,18 @@ def process_frames(
 
         try:
             if exit_on_empty:
-                frame_name, frame_time = frame_queue.get(False)
+                queued_frame = frame_queue.get(False)
             else:
-                frame_name, frame_time = frame_queue.get(True, 1)
+                queued_frame = frame_queue.get(True, 1)
         except queue.Empty:
             if exit_on_empty:
                 logger.info("Exiting track_objects...")
                 break
             continue
+
+        # replayed frames also say whether detection was wanted when they were
+        # captured, live frames use the current detect setting
+        frame_name, frame_time, *replay_flags = queued_frame
 
         camera_metrics.detection_frame.value = frame_time
         ptz_metrics.frame_time.value = frame_time
@@ -304,7 +308,11 @@ def process_frames(
         consolidated_detections = []
 
         # if detection is disabled
-        if not camera_config.detect.enabled:
+        detect_enabled = (
+            replay_flags[0] if replay_flags else camera_config.detect.enabled
+        )
+
+        if not detect_enabled:
             object_tracker.match_and_update(frame_name, frame_time, [])
         else:
             # get stationary object ids

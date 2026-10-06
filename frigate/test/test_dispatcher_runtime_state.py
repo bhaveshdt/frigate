@@ -261,6 +261,26 @@ class TestHandlersPersistViaSet(unittest.TestCase):
         self.dispatcher._on_detect_command("front_door", "ON")
         self.assertEqual(self._stored_state(), {"front_door": {"detect": True}})
 
+    def test_detect_handler_stamps_the_time_the_command_arrived(self) -> None:
+        # detect mode replay selects the footage around the event from this
+        # time, so it has to be on the config that is published
+        calls: list[tuple] = []
+        self.cameras["front_door"].detect.mark_event.side_effect = (
+            lambda timestamp: calls.append(("mark", timestamp))
+        )
+        self.dispatcher.config_updater.publish_update.side_effect = (
+            lambda *_: calls.append(("publish",))
+        )
+
+        with patch("frigate.comms.dispatcher.time") as fake_time:
+            fake_time.time.return_value = 1234.5
+            self.dispatcher._on_detect_command("front_door", "ON")
+            self.dispatcher._on_detect_command("front_door", "OFF")
+
+        self.assertEqual(
+            calls, [("mark", 1234.5), ("publish",), ("mark", 1234.5), ("publish",)]
+        )
+
     def test_recordings_handler_persists(self) -> None:
         self.dispatcher._on_recordings_command("front_door", "ON")
         self.assertEqual(self._stored_state(), {"front_door": {"recordings": True}})

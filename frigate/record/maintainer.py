@@ -44,6 +44,7 @@ from frigate.models import Recordings, ReviewSegment
 from frigate.review.types import SeverityEnum
 from frigate.util.media import get_keyframe_offsets
 from frigate.util.ownership import chown_to_runtime
+from frigate.util.segment_time import measure_segment_start
 from frigate.util.services import get_video_properties
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,10 @@ SEGMENT_CHAIN_DRIFT_LIMIT_S = 0.5
 # processes, and the probes then blow their own timeouts together, so
 # segments get discarded as corrupt and the record watchdog restarts ffmpeg
 MAX_CONCURRENT_SEGMENT_PROBES = 4
+
+# a replayed segment counts as analyzed once a frame this close to its end has
+# been processed, the last selected frame can trail the end by a frame interval
+REPLAY_HOLD_SLACK_S = 2.0
 
 
 def parse_cache_segment_name(basename: str) -> tuple[str, str, str] | None:
@@ -246,18 +251,13 @@ class RecordingMaintainer(threading.Thread):
         """
         filename_ts = filename_start.timestamp()
 
-        measured: float | None = None
         try:
             mtime = os.path.getmtime(cache_path)
         except OSError:
             mtime = None
-        if mtime is not None:
-            candidate = mtime - duration
-            # media shorter than its wall span (a stalled stream, an early
-            # close) derives a start past the truncation window, where the
-            # floored filename start is safer
-            if 0 <= candidate - filename_ts < SEGMENT_CHAIN_TOLERANCE_S:
-                measured = candidate
+
+        # shared with detect replay so both agree on when a segment started
+        measured = measure_segment_start(filename_ts, mtime, duration)
 
         last_end = self._get_last_segment_end(camera, stream_type)
 
@@ -429,7 +429,15 @@ class RecordingMaintainer(threading.Thread):
                 len(grouped_recordings[key]) - processed_segment_count
             )
             if unprocessed_segment_count > keep_count:
-                logger.warning(
+                camera_config = self.config.cameras.get(camera)
+                # replay mode has no detection between triggers, so an idle
+                # camera always has unprocessed segments in cache
+                log = (
+                    logger.debug
+                    if camera_config is not None and camera_config.detect_replay
+                    else logger.warning
+                )
+                log(
                     f"Too many unprocessed recording segments in cache for {camera}. This likely indicates an issue with the detect stream, keeping the {keep_count} most recent segments out of {unprocessed_segment_count} and discarding the rest..."
                 )
                 to_remove = grouped_recordings[key][:-keep_count]
@@ -698,12 +706,14 @@ class RecordingMaintainer(threading.Thread):
         )
 
         # ensure delayed segment info does not lead to lost segments, every
-        # retention decision below depends on complete stats for the segment
+        # retention decision below depends on complete stats for the segment.
+        # A replayed segment is analyzed after it closes, and the last frame
+        # picked from it can trail its end, so replay cameras get some slack
         if (
             datetime.datetime.fromtimestamp(
                 most_recently_processed_frame_time
             ).astimezone(datetime.UTC)
-            < end_time
+            < end_time - datetime.timedelta(seconds=self.replay_slack(camera))
         ):
             return None
 
@@ -825,6 +835,21 @@ class RecordingMaintainer(threading.Thread):
                 self.drop_segment(cache_path)
 
         return None
+
+    def replay_slack(self, camera: str) -> float:
+        """Seconds a segment's last processed frame may trail its end.
+
+        Replayed frames carry the time they were captured at and the last one
+        picked from a segment can fall a frame interval before its end, so a
+        replay camera's segment counts as analyzed slightly early. Cameras
+        that are not in replay mode get none.
+        """
+        camera_config = self.config.cameras.get(camera)
+
+        if getattr(camera_config, "detect_replay", None) is True:
+            return REPLAY_HOLD_SLACK_S
+
+        return 0.0
 
     def _compute_motion_heatmap(
         self, camera: str, motion_boxes: list[tuple[int, int, int, int]]

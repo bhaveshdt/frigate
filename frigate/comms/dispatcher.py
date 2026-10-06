@@ -3,6 +3,7 @@
 import datetime
 import json
 import logging
+import time
 from collections.abc import Callable, Iterable
 from typing import Any, cast
 
@@ -643,6 +644,9 @@ class Dispatcher:
 
     def _on_detect_command(self, camera_name: str, payload: str) -> None:
         """Callback for detect topic."""
+        # the hardware event behind this command is not older than its arrival,
+        # and detect mode replay selects the footage around it from this time
+        event_time = time.time()
         detect_settings = self.config.cameras[camera_name].detect
         motion_settings = self.config.cameras[camera_name].motion
 
@@ -668,6 +672,7 @@ class Dispatcher:
                 logger.info(f"Turning off detection for {camera_name}")
                 detect_settings.enabled = False
 
+        detect_settings.mark_event(event_time)
         self.config_updater.publish_update(
             CameraConfigUpdateTopic(CameraConfigUpdateEnum.detect, camera_name),
             detect_settings,

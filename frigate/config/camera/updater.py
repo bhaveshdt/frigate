@@ -1,11 +1,16 @@
 """Convenience classes for updating configurations dynamically."""
 
+import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
 from frigate.comms.config_updater import ConfigPublisher, ConfigSubscriber
 from frigate.config import CameraConfig, FrigateConfig
+from frigate.config.camera.detect import DetectModeEnum
+
+logger = logging.getLogger(__name__)
 
 
 class CameraConfigUpdateEnum(str, Enum):
@@ -67,10 +72,17 @@ class CameraConfigUpdateSubscriber:
         config: FrigateConfig | None,
         camera_configs: dict[str, CameraConfig],
         topics: list[CameraConfigUpdateEnum],
+        on_detect_event: Callable[[str, bool, float | None], None] | None = None,
     ):
         self.config = config
         self.camera_configs = camera_configs
         self.topics = topics
+        # called once for every detect update, in the order they were published,
+        # with the camera, whether detection is now enabled, and the time the
+        # toggle was received. Polling the config instead would only see the
+        # state at the moment of the poll, so a toggle that flips back within
+        # one poll would be lost and the time would be that of the poll.
+        self.on_detect_event = on_detect_event
 
         base_topic = "config/cameras"
 
@@ -115,7 +127,31 @@ class CameraConfigUpdateSubscriber:
         elif update_type == CameraConfigUpdateEnum.birdseye:
             config.birdseye = updated_config
         elif update_type == CameraConfigUpdateEnum.detect:
+            old_mode = config.detect.mode
+            new_mode = getattr(updated_config, "mode", old_mode)
+
+            # a runtime update skips the camera validator, so a switch to
+            # replay is checked here against what is actually being recorded
+            if new_mode != old_mode and new_mode == DetectModeEnum.replay:
+                reason = config.replay_blocker(bool(config.record.enabled_in_config))
+
+                if reason is not None:
+                    logger.error(
+                        "Not switching %s to detect mode replay: %s", camera, reason
+                    )
+                    return
+
             config.detect = updated_config
+            # the detect output of the ffmpeg commands is gated on the mode
+            if old_mode != new_mode:
+                config.recreate_ffmpeg_cmds()
+
+            if self.on_detect_event is not None:
+                self.on_detect_event(
+                    camera,
+                    updated_config.enabled,
+                    getattr(updated_config, "event_time", None),
+                )
         elif update_type == CameraConfigUpdateEnum.enabled:
             config.enabled = updated_config
         elif update_type == CameraConfigUpdateEnum.object_genai:

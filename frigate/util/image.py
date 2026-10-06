@@ -1180,8 +1180,13 @@ def run_ffmpeg_snapshot(
     seek_time: float | None = None,
     height: int | None = None,
     timeout: int | None = None,
+    seek_from_end: float | None = None,
 ) -> tuple[bytes | None, str]:
-    """Run ffmpeg to extract a snapshot/image from a video source."""
+    """Run ffmpeg to extract a snapshot/image from a video source.
+
+    seek_time seeks from the start of the file; seek_from_end instead seeks to
+    that many seconds before the end, for the latest frame of a finished file.
+    """
     ffmpeg_cmd = [
         ffmpeg.ffmpeg_path,
         "-hide_banner",
@@ -1191,6 +1196,9 @@ def run_ffmpeg_snapshot(
 
     if seek_time is not None:
         ffmpeg_cmd.extend(["-ss", f"00:00:{seek_time}"])
+
+    if seek_from_end is not None:
+        ffmpeg_cmd.extend(["-sseof", f"-{seek_from_end}"])
 
     ffmpeg_cmd.extend(
         [

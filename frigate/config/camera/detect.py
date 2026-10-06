@@ -1,10 +1,22 @@
-from pydantic import Field, model_validator
+from enum import Enum
+
+from pydantic import Field, PrivateAttr, model_validator
 
 from frigate.detectors.detector_config import DEFAULT_SCENE, SCENE_PATTERN
 
 from ..base import FrigateBaseModel
 
-__all__ = ["DetectConfig", "StationaryConfig", "StationaryMaxFramesConfig"]
+__all__ = [
+    "DetectConfig",
+    "DetectModeEnum",
+    "StationaryConfig",
+    "StationaryMaxFramesConfig",
+]
+
+
+class DetectModeEnum(str, Enum):
+    continuous = "continuous"
+    replay = "replay"
 
 
 class StationaryMaxFramesConfig(FrigateBaseModel):
@@ -52,6 +64,11 @@ class DetectConfig(FrigateBaseModel):
         title="Enable object detection",
         description="Enable or disable object detection for all cameras; can be overridden per-camera.",
     )
+    mode: DetectModeEnum = Field(
+        default=DetectModeEnum.continuous,
+        title="Detect mode",
+        description="How frames reach object detection. 'continuous' decodes the detect stream all the time. 'replay' never decodes a stream continuously and instead decodes the recorded main stream footage around each detection trigger, keeping the original frame timestamps. Replay requires recording to be enabled.",
+    )
     height: int | None = Field(
         default=None,
         title="Detect height",
@@ -94,6 +111,23 @@ class DetectConfig(FrigateBaseModel):
         title="Annotation offset",
         description="Milliseconds to shift detect annotations to better align timeline bounding boxes with recordings; can be positive or negative.",
     )
+
+    # when the last runtime toggle of `enabled` arrived, never part of the config
+    _event_time: float | None = PrivateAttr(default=None)
+
+    @property
+    def event_time(self) -> float | None:
+        """Epoch seconds the last runtime toggle of detection was received.
+
+        Detect mode replay needs the time of the event, not the time something
+        noticed that the state changed, to pick the footage around it. It is
+        None for a config that was never toggled at runtime.
+        """
+        return self._event_time
+
+    def mark_event(self, timestamp: float) -> None:
+        """Record when a runtime toggle of detection was received."""
+        self._event_time = timestamp
 
     @model_validator(mode="after")
     def validate_dimensions(self) -> "DetectConfig":

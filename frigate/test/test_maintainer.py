@@ -198,6 +198,79 @@ class TestMaintainer(unittest.IsolatedAsyncioTestCase):
         maintainer.drop_segment.assert_not_called()
         maintainer.move_segment.assert_awaited_once()
 
+    async def _validate(self, detect_replay, processed_offset):
+        config = MagicMock(spec=FrigateConfig)
+        camera_config = MagicMock()
+        camera_config.detect_replay = detect_replay
+        camera_config.record.enabled = True
+        camera_config.record.continuous.days = 0
+        camera_config.record.motion.days = 0
+        camera_config.record.event_pre_capture = 5
+        camera_config.record.alerts.retain.mode = "motion"
+        camera_config.record.detections.retain.mode = "motion"
+        config.cameras = {"test_cam": camera_config}
+
+        maintainer = RecordingMaintainer(config, MagicMock())
+        end_time = datetime.datetime.now(datetime.UTC) - datetime.timedelta(minutes=5)
+        start_time = end_time - datetime.timedelta(seconds=10)
+        cache_path = "/tmp/cache/test_cam@20260417150000+0000.mp4"
+
+        maintainer.end_time_cache = {
+            cache_path: (end_time, 10.0, None, None, None, None, None)
+        }
+        maintainer.object_recordings_info["test_cam"] = [
+            (end_time.timestamp() + processed_offset, [], [], [])
+        ]
+        maintainer.audio_recordings_info["test_cam"] = []
+        maintainer.drop_segment = MagicMock()
+        maintainer.move_segment = AsyncMock(return_value={"moved": True})
+        maintainer.recordings_publisher = MagicMock()
+
+        # a review that is still in progress overlaps the segment
+        review = MagicMock(
+            start_time=start_time.timestamp() - 1, end_time=None, severity="alert"
+        )
+        camera_config.get_review_pre_capture = MagicMock(return_value=0)
+        camera_config.record.get_review_pre_capture = MagicMock(return_value=0)
+        camera_config.record.get_review_post_capture = MagicMock(return_value=0)
+
+        result = await maintainer.validate_and_move_segment(
+            "test_cam",
+            reviews=[review],
+            recording={
+                "start_time": start_time,
+                "cache_path": cache_path,
+                "stream_type": "main",
+            },
+        )
+        return maintainer, result
+
+    async def test_replay_segment_is_held_until_its_frames_are_processed(self):
+        # nothing from the segment has been replayed yet, so it has no stats and
+        # an in-progress review would discard it
+        maintainer, result = await self._validate(True, -60)
+
+        self.assertIsNone(result)
+        maintainer.drop_segment.assert_not_called()
+        maintainer.move_segment.assert_not_called()
+
+    async def test_replay_segment_is_handled_when_its_last_frame_trails_the_end(
+        self,
+    ):
+        # the last frame picked from a replayed segment falls a frame interval
+        # before the segment end and no later frame follows it
+        maintainer, _ = await self._validate(True, -1)
+
+        maintainer.drop_segment.assert_called_once()
+
+    async def test_continuous_segment_gets_no_slack(self):
+        # same frame lag, but a live camera keeps producing frames past the end
+        maintainer, result = await self._validate(False, -1)
+
+        self.assertIsNone(result)
+        maintainer.drop_segment.assert_not_called()
+        maintainer.move_segment.assert_not_called()
+
     async def test_expire_stale_recordings_info_drops_only_absent_cameras(self):
         config = MagicMock(spec=FrigateConfig)
         config.cameras = {}

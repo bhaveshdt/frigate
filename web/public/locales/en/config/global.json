@@ -458,6 +458,10 @@
       "label": "Enable object detection",
       "description": "Enable or disable object detection for all cameras; can be overridden per-camera."
     },
+    "mode": {
+      "label": "Detect mode",
+      "description": "How frames reach object detection. 'continuous' decodes the detect stream all the time. 'replay' never decodes a stream continuously and instead decodes the recorded main stream footage around each detection trigger, keeping the original frame timestamps. Replay requires recording to be enabled."
+    },
     "height": {
       "label": "Detect height",
       "description": "Height (pixels) of frames used for the detect stream; leave empty to use the native stream resolution."

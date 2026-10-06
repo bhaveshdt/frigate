@@ -312,6 +312,17 @@ ffmpeg:
 detect:
   # Optional: enables detection for the camera (default: shown below)
   enabled: False
+  # Optional: how frames reach object detection (default: shown below)
+  #   continuous: the detect stream is decoded all the time, as Frigate normally works.
+  #   replay:     no stream is decoded continuously. When detection is turned on by a
+  #               hardware or external event (detect/set ON over MQTT), Frigate decodes the
+  #               recorded main stream segments around the event, from just before the
+  #               trigger, and runs them through the normal detector and tracker. Frames
+  #               keep the time they were captured at. Recording and live view are
+  #               unaffected. See https://docs.frigate.video/configuration/detect_replay
+  # NOTE: replay requires recording to be enabled. Detection runs on the footage once
+  #       each recording segment has finished, so it trails the event by up to a segment.
+  mode: continuous
   # Optional: width of the frame for the input with the detect role (default: use native stream resolution)
   width: 1280
   # Optional: height of the frame for the input with the detect role (default: use native stream resolution)

@@ -1,4 +1,5 @@
 import os
+import re
 from enum import Enum
 
 from pydantic import Field, PrivateAttr, model_validator
@@ -6,6 +7,7 @@ from pydantic import Field, PrivateAttr, model_validator
 from frigate.const import (
     CACHE_DIR,
     CACHE_SEGMENT_FORMAT,
+    LIBAVFORMAT_VERSION_MAJOR,
     REGEX_CAMERA_NAME,
     SUB_CACHE_TAG,
 )
@@ -30,8 +32,8 @@ from ..classification import (
 )
 from .audio import AudioConfig
 from .birdseye import BirdseyeCameraConfig
-from .detect import DetectConfig
-from .ffmpeg import CameraFfmpegConfig, CameraInput
+from .detect import DetectConfig, DetectModeEnum
+from .ffmpeg import CameraFfmpegConfig, CameraInput, CameraRoleEnum
 from .live import CameraLiveConfig
 from .motion import MotionConfig
 from .mqtt import CameraMqttConfig
@@ -47,6 +49,17 @@ from .ui import CameraUiConfig
 from .zone import ZoneConfig
 
 __all__ = ["CameraConfig"]
+
+# ffmpeg flags that only make sense on a live stream and break a recorded file.
+# dump_extra re-inserts parameter sets that an mp4 already carries, which makes
+# the hardware decoder reject every packet
+STREAM_ONLY_ARGS = ("-bsf:v", "dump_extra")
+
+REPLAY_PASSTHROUGH_ARGS = (
+    ["-fps_mode", "passthrough"]
+    if LIBAVFORMAT_VERSION_MAJOR >= 59
+    else ["-vsync", "0"]
+)
 
 
 class CameraTypeEnum(str, Enum):
@@ -237,6 +250,67 @@ class CameraConfig(FrigateBaseModel):
 
         super().__init__(**config)
 
+    @model_validator(mode="after")
+    def validate_detect_mode(self) -> "CameraConfig":
+        if self.detect.mode == DetectModeEnum.replay:
+            reason = self.replay_blocker()
+
+            if reason is not None:
+                raise ValueError(reason)
+
+        return self
+
+    def replay_blocker(self, record_enabled: bool | None = None) -> str | None:
+        """Why detect mode replay cannot run on this camera, or None if it can.
+
+        Replay analyzes recorded footage, so it needs recording and an input
+        that records. It also cannot honor continuous or motion retention: the
+        recording maintainer only keeps footage for those once detection has
+        reported on it, and between hardware events nothing is analyzed, so
+        that footage would be trimmed from the cache without a word. Refusing
+        the combination is better than quietly recording less than configured.
+
+        This is the one definition of the rule: the config validator applies
+        it when a config is loaded, and the runtime updater applies it before a
+        camera is switched to replay, which skips the validator.
+
+        Args:
+            record_enabled: Whether the camera records, when that differs from
+                the config's own value (a runtime update is judged on what is
+                actually being recorded).
+        """
+        if not (self.record.enabled if record_enabled is None else record_enabled):
+            return "detect -> mode replay requires recording to be enabled because replay analyzes recorded footage"
+
+        if not any(CameraRoleEnum.record in i.roles for i in self.ffmpeg.inputs):
+            return "detect -> mode replay requires an input with the record role"
+
+        retention = {
+            "continuous": self.record.continuous.days,
+            "motion": self.record.motion.days,
+        }
+
+        if self.record.sub.enabled:
+            retention["sub stream continuous"] = self.record.sub.continuous.days
+            retention["sub stream motion"] = self.record.sub.motion.days
+
+        configured = [name for name, days in retention.items() if days > 0]
+
+        if configured:
+            return (
+                f"detect -> mode replay cannot be used with {' or '.join(configured)} "
+                "recording retention because footage between hardware events is "
+                "never analyzed and would not be kept. Set those retention days "
+                "to 0 and use alert and detection retention instead"
+            )
+
+        return None
+
+    @property
+    def detect_replay(self) -> bool:
+        """Whether detection replays recorded footage instead of decoding a stream."""
+        return self.detect.mode == DetectModeEnum.replay
+
     @property
     def frame_shape(self) -> tuple[int, int]:
         return self.detect.height, self.detect.width
@@ -272,12 +346,162 @@ class CameraConfig(FrigateBaseModel):
             if ffmpeg_cmd is None:
                 continue
 
-            ffmpeg_cmds.append({"roles": ffmpeg_input.roles, "cmd": ffmpeg_cmd})
+            # replay mode has no detect output, so the process is not a detect process
+            roles = [
+                role
+                for role in ffmpeg_input.roles
+                if not (self.detect_replay and role == CameraRoleEnum.detect)
+            ]
+            ffmpeg_cmds.append({"roles": roles, "cmd": ffmpeg_cmd})
         self._ffmpeg_cmds = ffmpeg_cmds
+
+    def _get_hwaccel_args(self, ffmpeg_input: CameraInput) -> list[str]:
+        """Hardware acceleration decode args for an input."""
+        camera_arg = (
+            self.ffmpeg.hwaccel_args if self.ffmpeg.hwaccel_args != "auto" else None
+        )
+        return get_ffmpeg_arg_list(
+            parse_preset_hardware_acceleration_decode(
+                ffmpeg_input.hwaccel_args,
+                self.detect.fps,
+                self.detect.width,
+                self.detect.height,
+                self.ffmpeg.gpu,
+            )
+            or ffmpeg_input.hwaccel_args
+            or parse_preset_hardware_acceleration_decode(
+                camera_arg,
+                self.detect.fps,
+                self.detect.width,
+                self.detect.height,
+                self.ffmpeg.gpu,
+            )
+            or camera_arg
+            or []
+        )
+
+    def get_replay_ffmpeg_cmd(self, segment_path: str) -> list[str] | None:
+        """Build the ffmpeg command that decodes a recorded main stream segment.
+
+        Uses the same hardware decode and scale presets as the detect role, so
+        frames come out at detect width and height as raw yuv420p on stdout.
+        Stream input args are left out because they are for live streams.
+        """
+        ffmpeg_input = next(
+            (i for i in self.ffmpeg.inputs if CameraRoleEnum.record in i.roles), None
+        )
+
+        if ffmpeg_input is None:
+            return None
+
+        scale_args = self._replay_filter_args(
+            parse_preset_hardware_acceleration_scale(
+                ffmpeg_input.hwaccel_args or self.ffmpeg.hwaccel_args,
+                get_ffmpeg_arg_list(self.ffmpeg.output_args.detect),
+                self.detect.fps,
+                self.detect.width,
+                self.detect.height,
+            ),
+            self.detect.fps,
+        )
+        global_args = self._replay_global_args(
+            get_ffmpeg_arg_list(ffmpeg_input.global_args or self.ffmpeg.global_args)
+        )
+        hwaccel_args = self._strip_stream_only_args(
+            self._get_hwaccel_args(ffmpeg_input)
+        )
+
+        cmd = (
+            [self.ffmpeg.ffmpeg_path]
+            + global_args
+            + hwaccel_args
+            + ["-i", segment_path]
+            + scale_args
+            + ["pipe:"]
+        )
+
+        return [part for part in cmd if part != ""]
+
+    @staticmethod
+    def _strip_stream_only_args(args: list[str]) -> list[str]:
+        """Remove args that are only valid when reading a live stream."""
+        stripped: list[str] = []
+        index = 0
+
+        while index < len(args):
+            if tuple(args[index : index + 2]) == STREAM_ONLY_ARGS:
+                index += 2
+                continue
+
+            stripped.append(args[index])
+            index += 1
+
+        return stripped
+
+    @staticmethod
+    def _replay_global_args(args: list[str]) -> list[str]:
+        """Log at info level with a level tag on every line.
+
+        The replay reads the capture time of each frame from showinfo, which
+        logs at info level. The tag lets the reader tell those lines apart from
+        warnings and errors.
+        """
+        kept: list[str] = []
+        index = 0
+
+        while index < len(args):
+            if args[index] in ("-loglevel", "-v"):
+                index += 2
+                continue
+
+            kept.append(args[index])
+            index += 1
+
+        return kept + ["-loglevel", "level+info"]
+
+    @staticmethod
+    def _replay_filter_args(scale_args: list[str], fps: int | float) -> list[str]:
+        """Pick frames by their real capture time instead of resampling them.
+
+        The cache stamps frames with their arrival time, so spacing is uneven
+        and an fps filter would duplicate frames to fill gaps, giving copies a
+        made up time. Instead the first frame in each 1/fps window of the
+        segment is kept and every other frame is dropped before any scaling or
+        download. showinfo then logs the untouched presentation time of each
+        kept frame, which is read back as its timestamp. It must come before
+        the hardware scaler, since vpp_qsv rewrites the time base to the frame
+        rate and rounds the time of every frame to it. After that the time is
+        renumbered, because the scaler's rounding can give two kept frames the
+        same time, which the muxer rejects as non monotonic.
+        """
+        args = list(scale_args)
+
+        # an output frame rate would make ffmpeg duplicate and drop frames
+        while "-r" in args:
+            index = args.index("-r")
+            del args[index : index + 2]
+
+        select = (
+            f"select=isnan(prev_selected_t)+"
+            f"gt(floor(t*{fps})\\,floor(prev_selected_t*{fps}))"
+        )
+        prefix = f"{select},showinfo,setpts=N/TB"
+
+        if "-vf" not in args:
+            return REPLAY_PASSTHROUGH_ARGS + ["-vf", prefix] + args
+
+        index = args.index("-vf") + 1
+        video_filter = re.sub(r"framerate=[\d.]+:", "", args[index])
+        video_filter = re.sub(r":framerate=[\d.]+", "", video_filter)
+        video_filter = re.sub(r"(^|,)fps=[\d.]+(?=,|$)", "", video_filter).lstrip(",")
+        args[index] = f"{prefix},{video_filter}" if video_filter else prefix
+
+        return REPLAY_PASSTHROUGH_ARGS + args
 
     def _get_ffmpeg_cmd(self, ffmpeg_input: CameraInput):
         ffmpeg_output_args = []
-        if "detect" in ffmpeg_input.roles:
+        # replay mode decodes recorded segments on demand instead of a detect output
+        if "detect" in ffmpeg_input.roles and not self.detect_replay:
             detect_args = get_ffmpeg_arg_list(self.ffmpeg.output_args.detect)
             scale_detect_args = parse_preset_hardware_acceleration_scale(
                 ffmpeg_input.hwaccel_args or self.ffmpeg.hwaccel_args,
@@ -334,28 +558,7 @@ class CameraConfig(FrigateBaseModel):
             ffmpeg_input.global_args or self.ffmpeg.global_args
         )
 
-        camera_arg = (
-            self.ffmpeg.hwaccel_args if self.ffmpeg.hwaccel_args != "auto" else None
-        )
-        hwaccel_args = get_ffmpeg_arg_list(
-            parse_preset_hardware_acceleration_decode(
-                ffmpeg_input.hwaccel_args,
-                self.detect.fps,
-                self.detect.width,
-                self.detect.height,
-                self.ffmpeg.gpu,
-            )
-            or ffmpeg_input.hwaccel_args
-            or parse_preset_hardware_acceleration_decode(
-                camera_arg,
-                self.detect.fps,
-                self.detect.width,
-                self.detect.height,
-                self.ffmpeg.gpu,
-            )
-            or camera_arg
-            or []
-        )
+        hwaccel_args = self._get_hwaccel_args(ffmpeg_input)
         input_args = get_ffmpeg_arg_list(
             parse_preset_input(ffmpeg_input.input_args, self.detect.fps)
             or ffmpeg_input.input_args
@@ -366,7 +569,11 @@ class CameraConfig(FrigateBaseModel):
         cmd = (
             [self.ffmpeg.ffmpeg_path]
             + global_args
-            + (hwaccel_args if "detect" in ffmpeg_input.roles else [])
+            + (
+                hwaccel_args
+                if "detect" in ffmpeg_input.roles and not self.detect_replay
+                else []
+            )
             + input_args
             + ["-i", escape_special_characters(ffmpeg_input.path)]
             + ffmpeg_output_args
