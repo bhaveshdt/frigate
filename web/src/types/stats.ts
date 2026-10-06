@@ -19,13 +19,14 @@ export type CameraStats = {
   camera_fps: number;
   capture_pid: number;
   detection_enabled: number;
+  detect_replay?: boolean;
   detection_fps: number;
   ffmpeg_pid: number;
   pid: number;
   process_fps: number;
   skipped_fps: number;
   skipped_pct: number;
-  connection_quality: "excellent" | "fair" | "poor" | "unusable";
+  connection_quality: "excellent" | "fair" | "poor" | "unusable" | "replay";
   expected_fps: number;
   reconnects_last_hour: number;
   stalls_last_hour: number;

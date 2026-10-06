@@ -343,9 +343,10 @@ class TestDetectModeUpdates(unittest.TestCase):
 
     def test_replay_blocker_matches_what_the_validator_enforces(self):
         assert _build_mode_camera("replay").replay_blocker() is None
-        assert "requires recording" in _build_mode_camera(
-            "continuous", record_enabled=False
-        ).replay_blocker()
+        assert (
+            "requires recording"
+            in _build_mode_camera("continuous", record_enabled=False).replay_blocker()
+        )
         # an explicit value overrides the config, for runtime checks
         assert (
             _build_mode_camera("continuous").replay_blocker(record_enabled=False)

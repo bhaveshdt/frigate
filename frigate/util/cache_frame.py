@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import subprocess as sp
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -28,6 +29,12 @@ CACHE_FRAME_TIMEOUT_S = 10
 # seconds before the end of the segment to take the frame from
 CACHE_FRAME_SEEK_FROM_END_S = 0.5
 SEGMENT_PROBE_TIMEOUT_S = 10
+
+# the decoded frame of the newest finished segment per camera. A finished
+# segment never changes, so its frame is decoded once however often it is asked
+# for, instead of once per request
+_latest_frame_cache: dict[str, tuple[str, np.ndarray]] = {}
+_latest_frame_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -218,12 +225,20 @@ def get_latest_cache_frame(ffmpeg: Any, camera_name: str) -> np.ndarray | None:
 
     Lets stills be served for a camera whose detect stream is idle, without
     decoding anything until a frame is asked for. The segment ended when the
-    next one began, so the frame is at most one segment length old.
+    next one began, so the frame is at most one segment length old. The decoded
+    frame is kept until a newer segment finishes, so polling it does not run
+    ffmpeg again.
     """
     path = get_latest_finished_cache_segment(camera_name)
 
     if path is None:
         return None
+
+    with _latest_frame_lock:
+        cached = _latest_frame_cache.get(camera_name)
+
+    if cached is not None and cached[0] == path:
+        return cached[1].copy()
 
     image_data, error = run_ffmpeg_snapshot(
         ffmpeg,
@@ -237,4 +252,13 @@ def get_latest_cache_frame(ffmpeg: Any, camera_name: str) -> np.ndarray | None:
         logger.debug("Unable to read a frame from %s: %s", path, error)
         return None
 
-    return cv2.imdecode(np.frombuffer(image_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+    frame = cv2.imdecode(np.frombuffer(image_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+    if frame is not None:
+        with _latest_frame_lock:
+            _latest_frame_cache[camera_name] = (path, frame)
+
+        # callers draw on the frame, the cached one stays untouched
+        return frame.copy()
+
+    return None

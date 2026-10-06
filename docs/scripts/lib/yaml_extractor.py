@@ -20,9 +20,7 @@ class YamlBlock:
     section_key: str | None = None  # Detected top-level config section
     is_camera_level: bool = False  # Whether this is camera-level config
     camera_name: str | None = None  # Camera name if camera-level
-    config_keys: list[str] = field(
-        default_factory=list
-    )  # Top-level keys in the YAML
+    config_keys: list[str] = field(default_factory=list)  # Top-level keys in the YAML
 
 
 def extract_yaml_blocks(content: str) -> list[YamlBlock]:
@@ -65,9 +63,7 @@ def extract_yaml_blocks(content: str) -> list[YamlBlock]:
             raw = "\n".join(yaml_lines)
 
             # Check for inline comments
-            has_comments = any(
-                re.search(r"#\s*(<-|[A-Za-z])", yl) for yl in yaml_lines
-            )
+            has_comments = any(re.search(r"#\s*(<-|[A-Za-z])", yl) for yl in yaml_lines)
 
             # Parse YAML
             try:
@@ -198,9 +194,7 @@ def extract_config_tabs_blocks(content: str) -> list[ConfigTabsBlock]:
             if fence_match:
                 highlight = fence_match.group(1)
                 yaml_raw = fence_match.group(2)
-                has_comments = bool(
-                    re.search(r"#\s*(<-|[A-Za-z])", yaml_raw)
-                )
+                has_comments = bool(re.search(r"#\s*(<-|[A-Za-z])", yaml_raw))
 
                 try:
                     parsed = yaml.safe_load(yaml_raw)
@@ -213,9 +207,7 @@ def extract_config_tabs_blocks(content: str) -> list[ConfigTabsBlock]:
                     is_camera = False
                     camera_name = None
 
-                    if "cameras" in parsed and isinstance(
-                        parsed["cameras"], dict
-                    ):
+                    if "cameras" in parsed and isinstance(parsed["cameras"], dict):
                         is_camera = True
                         cam_entries = parsed["cameras"]
                         if len(cam_entries) == 1:

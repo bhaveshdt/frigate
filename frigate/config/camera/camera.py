@@ -1,3 +1,4 @@
+import logging
 import os
 import re
 from enum import Enum
@@ -50,15 +51,15 @@ from .zone import ZoneConfig
 
 __all__ = ["CameraConfig"]
 
+logger = logging.getLogger(__name__)
+
 # ffmpeg flags that only make sense on a live stream and break a recorded file.
 # dump_extra re-inserts parameter sets that an mp4 already carries, which makes
 # the hardware decoder reject every packet
 STREAM_ONLY_ARGS = ("-bsf:v", "dump_extra")
 
 REPLAY_PASSTHROUGH_ARGS = (
-    ["-fps_mode", "passthrough"]
-    if LIBAVFORMAT_VERSION_MAJOR >= 59
-    else ["-vsync", "0"]
+    ["-fps_mode", "passthrough"] if LIBAVFORMAT_VERSION_MAJOR >= 59 else ["-vsync", "0"]
 )
 
 
@@ -258,6 +259,24 @@ class CameraConfig(FrigateBaseModel):
             if reason is not None:
                 raise ValueError(reason)
 
+            # replay decodes the stream that records, so an input that only
+            # detects would never be opened and its stream is not used
+            unused = [
+                str(number)
+                for number, ffmpeg_input in enumerate(self.ffmpeg.inputs, start=1)
+                if CameraRoleEnum.detect in ffmpeg_input.roles
+                and CameraRoleEnum.record not in ffmpeg_input.roles
+            ]
+
+            if unused:
+                logger.warning(
+                    "%s: detect mode replay decodes the recorded stream, so input %s "
+                    "(detect role without record) is never opened. Give the input "
+                    "that records the detect role and remove the other one",
+                    self.name or "camera",
+                    ", ".join(unused),
+                )
+
         return self
 
     def replay_blocker(self, record_enabled: bool | None = None) -> str | None:
@@ -380,12 +399,19 @@ class CameraConfig(FrigateBaseModel):
             or []
         )
 
-    def get_replay_ffmpeg_cmd(self, segment_path: str) -> list[str] | None:
+    def get_replay_ffmpeg_cmd(
+        self, segment_path: str, software: bool = False
+    ) -> list[str] | None:
         """Build the ffmpeg command that decodes a recorded main stream segment.
 
         Uses the same hardware decode and scale presets as the detect role, so
         frames come out at detect width and height as raw yuv420p on stdout.
         Stream input args are left out because they are for live streams.
+
+        Args:
+            segment_path: the cache file to decode
+            software: decode and scale on the CPU, used when the hardware
+                decoder cannot read a segment
         """
         ffmpeg_input = next(
             (i for i in self.ffmpeg.inputs if CameraRoleEnum.record in i.roles), None
@@ -396,7 +422,9 @@ class CameraConfig(FrigateBaseModel):
 
         scale_args = self._replay_filter_args(
             parse_preset_hardware_acceleration_scale(
-                ffmpeg_input.hwaccel_args or self.ffmpeg.hwaccel_args,
+                None
+                if software
+                else ffmpeg_input.hwaccel_args or self.ffmpeg.hwaccel_args,
                 get_ffmpeg_arg_list(self.ffmpeg.output_args.detect),
                 self.detect.fps,
                 self.detect.width,
@@ -407,8 +435,10 @@ class CameraConfig(FrigateBaseModel):
         global_args = self._replay_global_args(
             get_ffmpeg_arg_list(ffmpeg_input.global_args or self.ffmpeg.global_args)
         )
-        hwaccel_args = self._strip_stream_only_args(
-            self._get_hwaccel_args(ffmpeg_input)
+        hwaccel_args = (
+            []
+            if software
+            else self._strip_stream_only_args(self._get_hwaccel_args(ffmpeg_input))
         )
 
         cmd = (

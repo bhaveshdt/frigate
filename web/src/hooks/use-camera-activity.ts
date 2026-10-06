@@ -39,6 +39,12 @@ export function isCameraOffline(
     return false;
   }
 
+  // a replay camera has no continuous frames while idle, so a camera_fps of
+  // zero is its normal state rather than a sign of a dead stream
+  if (stats.cameras[cameraName]?.detect_replay) {
+    return false;
+  }
+
   return (
     stats.cameras[cameraName]?.camera_fps == 0 && stats.service.uptime > 60
   );

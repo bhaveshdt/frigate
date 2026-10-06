@@ -236,6 +236,37 @@ def skipped_percent(skipped_fps: float, camera_fps: float, enabled: bool) -> flo
     return round(skipped_fps / camera_fps * 100, 1)
 
 
+def rate_connection(
+    current_fps: float,
+    expected_fps: float,
+    reconnects: int,
+    stalls: int,
+    detect_replay: bool = False,
+) -> str:
+    """Rate a camera's connection from its latest fps, reconnects and stalls.
+
+    A detect_replay camera has no continuous stream: its fps is zero while idle
+    and runs as fast as the decoder allows during a replay, so neither can be
+    compared against detect.fps. It reports the neutral "replay" rating.
+    """
+    if detect_replay:
+        return "replay"
+
+    if current_fps < 0.1:
+        return "unusable"
+
+    if reconnects == 0 and current_fps >= 0.9 * expected_fps and stalls < 5:
+        return "excellent"
+
+    if reconnects <= 2 and current_fps >= 0.6 * expected_fps:
+        return "fair"
+
+    if reconnects > 10 or current_fps < 1.0 or stalls > 100:
+        return "unusable"
+
+    return "poor"
+
+
 def get_go2rtc_pid(cpu_usages: dict[str, dict[str, Any]]) -> int | None:
     """Find the pid of the running go2rtc process in the cpu usages."""
     for pid, usage in cpu_usages.items():
@@ -281,16 +312,13 @@ def stats_snapshot(
         reconnects = camera_stats.reconnects_last_hour.value
         stalls = camera_stats.stalls_last_hour.value
 
-        if current_fps < 0.1:
-            quality_str = "unusable"
-        elif reconnects == 0 and current_fps >= 0.9 * expected_fps and stalls < 5:
-            quality_str = "excellent"
-        elif reconnects <= 2 and current_fps >= 0.6 * expected_fps:
-            quality_str = "fair"
-        elif reconnects > 10 or current_fps < 1.0 or stalls > 100:
-            quality_str = "unusable"
-        else:
-            quality_str = "poor"
+        quality_str = rate_connection(
+            current_fps,
+            expected_fps,
+            reconnects,
+            stalls,
+            camera_config.detect_replay,
+        )
 
         connection_quality = {
             "connection_quality": quality_str,
@@ -310,6 +338,9 @@ def stats_snapshot(
             ),
             "detection_fps": round(camera_stats.detection_fps.value, 2),
             "detection_enabled": camera_config.detect.enabled,
+            # a replay camera has no continuous frames while idle, so its
+            # camera_fps of zero does not mean the stream is offline
+            "detect_replay": camera_config.detect_replay,
             "pid": pid,
             "capture_pid": capture_pid,
             "ffmpeg_pid": ffmpeg_pid,

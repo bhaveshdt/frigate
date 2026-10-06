@@ -9,9 +9,12 @@ import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
+import cv2
+import numpy as np
 import psutil
 
 from frigate.config import CameraConfig, FrigateConfig
+from frigate.util import cache_frame
 from frigate.util.cache_frame import (
     CacheSegment,
     get_cache_files_in_use,
@@ -30,6 +33,7 @@ from frigate.video.detect_replay import (
 # with their arrival time
 UNEVEN_TIMES = [0.0, 0.3, 0.5]
 LOGGER = "frigate.video.detect_replay"
+JPEG = cv2.imencode(".jpg", np.zeros((8, 8, 3), np.uint8))[1].tobytes()
 
 
 def segment(path: str, start: float, duration: float = 10.0, **kwargs):
@@ -300,6 +304,46 @@ class TestCacheFilesInUse(unittest.TestCase):
         ]
 
         assert self._in_use(processes) == {"/tmp/cache/b.mp4"}
+
+
+class TestLatestCacheFrame(unittest.TestCase):
+    def setUp(self):
+        cache_frame._latest_frame_cache.clear()
+
+    def _get(self, path: str = "/c/a.mp4"):
+        with (
+            patch.object(
+                cache_frame, "get_latest_finished_cache_segment", return_value=path
+            ),
+            patch.object(
+                cache_frame, "run_ffmpeg_snapshot", return_value=(JPEG, "")
+            ) as snapshot,
+        ):
+            frame = cache_frame.get_latest_cache_frame("ffmpeg", "front_door")
+
+        return frame, snapshot
+
+    def test_a_finished_segment_is_decoded_once(self):
+        first, snapshot = self._get()
+        second, again = self._get()
+
+        assert first is not None
+        snapshot.assert_called_once()
+        again.assert_not_called()
+        assert (first == second).all()
+
+    def test_a_newer_segment_is_decoded_again(self):
+        self._get("/c/a.mp4")
+        _, snapshot = self._get("/c/b.mp4")
+
+        snapshot.assert_called_once()
+
+    def test_callers_cannot_change_the_cached_frame(self):
+        first, _ = self._get()
+        first[:] = 255
+        second, _ = self._get()
+
+        assert second.max() == 0
 
 
 class TestFfmpegStderr(unittest.TestCase):
@@ -607,15 +651,154 @@ class TestDetectReplayRunner(unittest.TestCase):
         assert start.call_count == 1
         assert len(self._drain(frame_queue)) == 3
 
-    def test_a_rewritten_file_with_the_same_name_is_replayed_again(self):
+    def test_replay_stops_at_the_end_of_the_range_and_that_is_not_a_failure(self):
+        segments = [segment("/c/a.mp4", 1000.0), segment("/c/b.mp4", 1010.0)]
+        runner, frame_queue, frame_size = build_runner(segments)
+        runner.tail = 4.4
+
+        runner.trigger(1005.0)
+        runner.release(1006.0)
+        calls: list[list[str]] = []
+
+        def start(cmd):
+            calls.append(cmd)
+            # the first segment ends by itself, the second is stopped on
+            # purpose at the end of the range, which ends ffmpeg with a signal
+            return fake_process(frame_size, return_code=0 if len(calls) == 1 else -15)
+
+        with (
+            patch.object(runner, "_start_process", side_effect=start),
+            patch("frigate.video.detect_replay.time") as fake_time,
+            self.assertNoLogs(LOGGER, level="WARNING"),
+        ):
+            fake_time.time.return_value = 1100.0
+            runner._replay_pending()
+
+        times = [i[1] for i in self._drain(frame_queue)]
+
+        # the range ends at 1010.4, so the frame at 1010.5 is never fed
+        assert times == [1000.0, 1000.3, 1000.5, 1010.0, 1010.3]
+        self.assertAlmostEqual(runner._cursor, 1010.4)
+        assert runner._pending() is False
+
+    def test_a_trigger_right_after_a_trimmed_replay_gets_its_pre_roll(self):
         segments = [segment("/c/a.mp4", 1000.0)]
         runner, frame_queue, frame_size = build_runner(segments)
+        runner.tail = 4.0
+        times = ["0", "5", "9"]
 
+        runner.trigger(1001.0)
+        runner.release(1002.0)
+        self._replay(runner, frame_size, times=times, return_code=-15)
+        first = [i[1] for i in self._drain(frame_queue)]
+
+        # a new event arrives after the first range ended
+        runner.trigger(1015.0)
+        self._replay(runner, frame_size, times=times)
+        second = [(i[1], i[2]) for i in self._drain(frame_queue)]
+
+        assert first == [1000.0, 1005.0]
+        # the frame the first range never reached is replayed as detection
+        # footage, and nothing already replayed is fed twice
+        assert second == [(1009.0, True)]
+
+    def test_a_hardware_decode_failure_is_retried_on_the_cpu(self):
+        runner, frame_queue, frame_size = build_runner([segment("/c/a.mp4", 1000.0)])
         runner.trigger(1008.0)
-        assert self._replay(runner, frame_size).call_count == 1
+        commands: list[list[str]] = []
 
-        segments[0] = segment("/c/a.mp4", 1000.5)
-        assert self._replay(runner, frame_size).call_count == 1
+        def start(cmd):
+            commands.append(cmd)
+
+            if len(commands) == 1:
+                return fake_process(frame_size, times=[], return_code=1)
+
+            return fake_process(frame_size)
+
+        def build(path, software=False):
+            return ["ffmpeg-cpu" if software else "ffmpeg-gpu", path]
+
+        with (
+            patch.object(CameraConfig, "get_replay_ffmpeg_cmd", side_effect=build),
+            patch.object(runner, "_start_process", side_effect=start),
+            self.assertLogs(LOGGER, level="WARNING") as logs,
+        ):
+            runner._replay_pending()
+
+        assert [c[0] for c in commands] == ["ffmpeg-gpu", "ffmpeg-cpu"]
+        assert len(self._drain(frame_queue)) == 3
+        assert "retrying it in software" in "\n".join(logs.output)
+
+    def test_nothing_is_retried_once_frames_were_handed_over(self):
+        runner, frame_queue, frame_size = build_runner([segment("/c/a.mp4", 1000.0)])
+        runner.trigger(1008.0)
+
+        def build(path, software=False):
+            return ["ffmpeg-cpu" if software else "ffmpeg-gpu", path]
+
+        with (
+            patch.object(CameraConfig, "get_replay_ffmpeg_cmd", side_effect=build),
+            patch.object(
+                runner,
+                "_start_process",
+                side_effect=lambda cmd: fake_process(frame_size, return_code=69),
+            ) as start,
+            self.assertLogs(LOGGER, level="WARNING"),
+        ):
+            runner._replay_pending()
+
+        assert start.call_count == 1
+        assert len(self._drain(frame_queue)) == 3
+
+    def test_there_is_no_retry_when_the_command_has_no_hardware_to_drop(self):
+        runner, _, frame_size = build_runner([segment("/c/a.mp4", 1000.0)])
+        runner.trigger(1008.0)
+
+        with (
+            patch.object(
+                CameraConfig,
+                "get_replay_ffmpeg_cmd",
+                side_effect=lambda path, software=False: ["ffmpeg", path],
+            ),
+            patch.object(
+                runner,
+                "_start_process",
+                side_effect=lambda cmd: fake_process(
+                    frame_size, times=[], return_code=1
+                ),
+            ) as start,
+            self.assertLogs(LOGGER, level="WARNING"),
+        ):
+            runner._replay_pending()
+
+        assert start.call_count == 1
+
+    def test_a_segment_that_raises_is_skipped_and_not_retried(self):
+        runner, _, _ = build_runner([segment("/c/a.mp4", 1000.0)])
+        runner.trigger(1008.0)
+
+        with (
+            patch.object(runner, "_start_process", side_effect=RuntimeError("boom")),
+            self.assertLogs(LOGGER, level="ERROR"),
+        ):
+            runner._replay_pending()
+
+        assert runner._cursor == 1010.0
+
+    def test_the_software_command_has_no_hardware_decode_or_scale(self):
+        runner, _, _ = build_runner([])
+        camera = runner.config
+        camera.ffmpeg.hwaccel_args = "preset-intel-qsv-h264"
+
+        hardware = camera.get_replay_ffmpeg_cmd("/c/a.mp4")
+        software = camera.get_replay_ffmpeg_cmd("/c/a.mp4", software=True)
+
+        assert "-hwaccel" in hardware
+        assert "-hwaccel" not in software
+        assert not any("vpp_qsv" in part for part in software)
+        assert any("scale=64:48" in part for part in software)
+        assert software[software.index("-i") + 1] == "/c/a.mp4"
+        assert software[-1] == "pipe:"
 
     def test_new_segments_are_picked_up_while_triggered(self):
         segments = [segment("/c/a.mp4", 1000.0)]

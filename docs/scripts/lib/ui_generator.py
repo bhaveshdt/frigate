@@ -88,9 +88,7 @@ def _is_hidden(
         if "*" in pattern:
             parts = pattern.split(".")
             if len(parts) == len(full_path):
-                match = all(
-                    p == "*" or p == fp for p, fp in zip(parts, full_path)
-                )
+                match = all(p == "*" or p == fp for p, fp in zip(parts, full_path))
                 if match:
                     return True
 
@@ -189,21 +187,15 @@ def generate_ui_content(
 
         if use_table:
             # Pattern A: Field table with descriptions
-            lines.append(
-                f'Navigate to <NavPath path="{nav_path}" />.'
-            )
+            lines.append(f'Navigate to <NavPath path="{nav_path}" />.')
             lines.append("")
             lines.append("| Field | Description |")
             lines.append("|-------|-------------|")
 
             for path, _value in visible_leaves:
                 path_list = list(path)
-                label = _build_field_label(
-                    i18n, section_key, path_list, i18n_level
-                )
-                desc = get_field_description(
-                    i18n, section_key, path_list, i18n_level
-                )
+                label = _build_field_label(i18n, section_key, path_list, i18n_level)
+                desc = get_field_description(i18n, section_key, path_list, i18n_level)
                 if not desc:
                     desc = ""
                 lines.append(f"| **{label}** | {desc} |")
@@ -214,9 +206,7 @@ def generate_ui_content(
             if multi_section:
                 camera_note = ""
                 if block.is_camera_level:
-                    camera_note = (
-                        " and select your camera"
-                    )
+                    camera_note = " and select your camera"
                 lines.append(
                     f'{step_num}. Navigate to <NavPath path="{nav_path}" />{camera_note}.'
                 )
@@ -226,18 +216,14 @@ def generate_ui_content(
                         f'1. Navigate to <NavPath path="{nav_path}" /> and select your camera.'
                     )
                 else:
-                    lines.append(
-                        f'Navigate to <NavPath path="{nav_path}" />.'
-                    )
+                    lines.append(f'Navigate to <NavPath path="{nav_path}" />.')
                     lines.append("")
 
             from .schema_loader import get_field_info
 
             for path, value in visible_leaves:
                 path_list = list(path)
-                label = _build_field_label(
-                    i18n, section_key, path_list, i18n_level
-                )
+                label = _build_field_label(i18n, section_key, path_list, i18n_level)
                 field_info = get_field_info(schema, section_key, path_list)
                 formatted = _format_value(value, field_info, i18n)
 
@@ -254,7 +240,9 @@ def generate_ui_content(
     return "\n".join(lines)
 
 
-def wrap_with_config_tabs(ui_content: str, yaml_raw: str, highlight: str | None = None) -> str:
+def wrap_with_config_tabs(
+    ui_content: str, yaml_raw: str, highlight: str | None = None
+) -> str:
     """Wrap UI content and YAML in ConfigTabs markup.
 
     Args:

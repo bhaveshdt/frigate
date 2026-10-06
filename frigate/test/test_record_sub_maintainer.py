@@ -261,11 +261,12 @@ class TestSegmentAudioPresence(unittest.IsolatedAsyncioTestCase):
                         "video_codec": video_codec,
                     }
                 )
+                keyframe_probe = AsyncMock(return_value=[0, 2000])
                 with (
                     patch("frigate.record.maintainer.get_video_properties", probe),
                     patch(
                         "frigate.record.maintainer.get_keyframe_offsets",
-                        AsyncMock(return_value=[0, 2000]),
+                        keyframe_probe,
                     ),
                 ):
                     await maintainer.validate_and_move_segment(
@@ -283,7 +284,9 @@ class TestSegmentAudioPresence(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(call_args[7], has_audio)
                 self.assertEqual(call_args[8], audio_rate)
                 self.assertEqual(call_args[9], audio_codec)
-                self.assertEqual(call_args[11], [0, 2000])
+                # keyframes are probed by move_segment, not at validation
+                self.assertIsNone(call_args[11])
+                keyframe_probe.assert_not_awaited()
                 self.assertEqual(call_args[10], video_codec)
                 # the probe result is cached alongside the end time so the
                 # cached path stays as informed as the probed path
@@ -342,9 +345,11 @@ class TestSegmentAudioPresence(unittest.IsolatedAsyncioTestCase):
                             audio_rate,
                             audio_codec,
                             video_codec,
+                            keyframes=[0, 2000],
                         )
 
                 self.assertIsNotNone(result)
+                self.assertEqual(result[Recordings.keyframes.name], [0, 2000])
                 self.assertEqual(result[Recordings.has_audio.name], has_audio)
                 self.assertEqual(result[Recordings.audio_rate.name], audio_rate)
                 self.assertEqual(result[Recordings.audio_codec.name], audio_codec)
@@ -429,6 +434,7 @@ class TestSegmentPathTime(unittest.IsolatedAsyncioTestCase):
                         0.96,
                         cache_path,
                         SegmentInfo(0, 0, 0, 0),
+                        keyframes=[0],
                     )
 
                 self.assertIsNotNone(result)
@@ -497,6 +503,7 @@ class TestMoveSegmentOwnership(unittest.IsolatedAsyncioTestCase):
                     10.0,
                     cache_path,
                     SegmentInfo(0, 0, 0, 0),
+                    keyframes=[0],
                 )
 
             self.assertIsNotNone(result)
@@ -754,3 +761,103 @@ class TestSegmentChainSeeding(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(calls[0].args[3].timestamp(), self.T0 + 10.75, places=3)
         # second segment chains off the first's in-memory end
         self.assertAlmostEqual(calls[1].args[2].timestamp(), self.T0 + 10.75, places=3)
+
+
+class TestKeyframeProbeDeferral(unittest.IsolatedAsyncioTestCase):
+    """Keyframe offsets are probed once, and only for segments that are kept."""
+
+    T0 = datetime.datetime(2026, 6, 10, 14, 30, 22, tzinfo=datetime.UTC).timestamp()
+
+    async def test_dropped_segment_never_probes_keyframes(self):
+        # motion retention with no motion: the segment is dropped
+        maintainer = _build_chaining_maintainer(self.T0, retention="motion")
+        keyframe_probe = AsyncMock(return_value=[0])
+        start = datetime.datetime.fromtimestamp(self.T0, tz=datetime.UTC)
+
+        with (
+            patch(
+                "frigate.record.maintainer.get_video_properties",
+                AsyncMock(return_value={"has_valid_video": True, "duration": 10.0}),
+            ),
+            patch("frigate.record.maintainer.get_keyframe_offsets", keyframe_probe),
+            patch(
+                "frigate.record.maintainer.os.path.getmtime",
+                MagicMock(side_effect=OSError("missing")),
+            ),
+        ):
+            await maintainer.validate_and_move_segment(
+                "test_cam",
+                reviews=[],
+                recording={
+                    "start_time": start,
+                    "cache_path": "/tmp/cache/test_cam@drop.mp4",
+                    "stream_type": "main",
+                },
+            )
+
+        maintainer.drop_segment.assert_called_once_with("/tmp/cache/test_cam@drop.mp4")
+        maintainer.move_segment.assert_not_awaited()
+        keyframe_probe.assert_not_awaited()
+
+    def _build_move_maintainer(self) -> RecordingMaintainer:
+        maintainer = _build_chaining_maintainer(self.T0)
+        maintainer.config.ffmpeg.ffmpeg_path = "ffmpeg"
+        maintainer.probe_semaphore = asyncio.Semaphore(1)
+        return maintainer
+
+    async def _move(
+        self, maintainer: RecordingMaintainer, keyframes: list[int] | None
+    ) -> tuple[dict | None, AsyncMock]:
+        start_time = datetime.datetime.fromtimestamp(self.T0, tz=datetime.UTC)
+        proc = MagicMock()
+        proc.returncode = 0
+        proc.wait = AsyncMock(return_value=0)
+        keyframe_probe = AsyncMock(return_value=[0, 3000])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, "test_cam@20260610143022+0000.mp4")
+            with open(cache_path, "wb") as f:
+                f.write(b"\x00" * 16)
+
+            with (
+                patch(
+                    "frigate.record.maintainer.RECORD_DIR",
+                    os.path.join(tmpdir, "recordings"),
+                ),
+                patch(
+                    "frigate.record.maintainer.asyncio.create_subprocess_exec",
+                    AsyncMock(return_value=proc),
+                ),
+                patch(
+                    "frigate.record.maintainer.get_keyframe_offsets", keyframe_probe
+                ),
+            ):
+                result = await RecordingMaintainer.move_segment(
+                    maintainer,
+                    "test_cam",
+                    "main",
+                    start_time,
+                    start_time + datetime.timedelta(seconds=10),
+                    10.0,
+                    cache_path,
+                    SegmentInfo(0, 0, 0, 0),
+                    keyframes=keyframes,
+                )
+
+        return result, keyframe_probe
+
+    async def test_move_segment_probes_missing_keyframes(self):
+        maintainer = self._build_move_maintainer()
+
+        result, keyframe_probe = await self._move(maintainer, None)
+
+        keyframe_probe.assert_awaited_once()
+        self.assertEqual(result[Recordings.keyframes.name], [0, 3000])
+
+    async def test_move_segment_reuses_known_keyframes(self):
+        maintainer = self._build_move_maintainer()
+
+        result, keyframe_probe = await self._move(maintainer, [0, 1500])
+
+        keyframe_probe.assert_not_awaited()
+        self.assertEqual(result[Recordings.keyframes.name], [0, 1500])

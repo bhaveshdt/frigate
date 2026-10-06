@@ -67,7 +67,7 @@ class DetectConfig(FrigateBaseModel):
     mode: DetectModeEnum = Field(
         default=DetectModeEnum.continuous,
         title="Detect mode",
-        description="How frames reach object detection. 'continuous' decodes the detect stream all the time. 'replay' never decodes a stream continuously and instead decodes the recorded main stream footage around each detection trigger, keeping the original frame timestamps. Replay requires recording to be enabled.",
+        description="How frames reach object detection. 'continuous' decodes the detect stream all the time. 'replay' never decodes a stream continuously and instead decodes the recorded main stream footage around each detection trigger, keeping the original frame timestamps. Replay decodes the stream that records, scaled to the detect width and height, so keep those in the same aspect ratio as the recorded stream, and an input that only has the detect role is never opened. Replay requires recording to be enabled.",
     )
     height: int | None = Field(
         default=None,

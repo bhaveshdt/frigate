@@ -7,7 +7,7 @@ import {
 import { cn } from "@/lib/utils";
 
 type ConnectionQualityIndicatorProps = {
-  quality: "excellent" | "fair" | "poor" | "unusable";
+  quality: "excellent" | "fair" | "poor" | "unusable" | "replay";
   expectedFps: number;
   reconnects: number;
   stalls: number;
@@ -31,6 +31,8 @@ export function ConnectionQualityIndicator({
         return "bg-orange-500";
       case "unusable":
         return "bg-destructive";
+      case "replay":
+        return "bg-gray-500";
       default:
         return "bg-gray-500";
     }

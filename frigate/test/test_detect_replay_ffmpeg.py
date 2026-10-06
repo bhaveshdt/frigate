@@ -30,9 +30,7 @@ QSV_DEVICE = "/dev/dri/renderD128"
 
 def build_camera(hwaccel: str | None = None) -> CameraConfig:
     ffmpeg: dict = {
-        "inputs": [
-            {"path": "rtsp://10.0.0.1:554/video", "roles": ["record", "detect"]}
-        ]
+        "inputs": [{"path": "rtsp://10.0.0.1:554/video", "roles": ["record", "detect"]}]
     }
 
     if hwaccel:

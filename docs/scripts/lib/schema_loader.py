@@ -21,9 +21,7 @@ def resolve_ref(schema: dict[str, Any], ref: str) -> dict[str, Any]:
     return node
 
 
-def resolve_schema_node(
-    schema: dict[str, Any], node: dict[str, Any]
-) -> dict[str, Any]:
+def resolve_schema_node(schema: dict[str, Any], node: dict[str, Any]) -> dict[str, Any]:
     """Resolve a schema node, following $ref and allOf if present."""
     if "$ref" in node:
         node = resolve_ref(schema, node["$ref"])

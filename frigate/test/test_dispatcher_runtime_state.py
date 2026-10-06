@@ -265,11 +265,11 @@ class TestHandlersPersistViaSet(unittest.TestCase):
         # detect mode replay selects the footage around the event from this
         # time, so it has to be on the config that is published
         calls: list[tuple] = []
-        self.cameras["front_door"].detect.mark_event.side_effect = (
-            lambda timestamp: calls.append(("mark", timestamp))
+        self.cameras["front_door"].detect.mark_event.side_effect = lambda timestamp: (
+            calls.append(("mark", timestamp))
         )
-        self.dispatcher.config_updater.publish_update.side_effect = (
-            lambda *_: calls.append(("publish",))
+        self.dispatcher.config_updater.publish_update.side_effect = lambda *_: (
+            calls.append(("publish",))
         )
 
         with patch("frigate.comms.dispatcher.time") as fake_time:

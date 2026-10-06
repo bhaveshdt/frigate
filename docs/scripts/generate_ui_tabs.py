@@ -91,8 +91,7 @@ def process_file(
     for block in blocks:
         # Skip non-config YAML blocks
         if block.section_key is None or (
-            block.section_key not in ALL_CONFIG_SECTIONS
-            and not block.is_camera_level
+            block.section_key not in ALL_CONFIG_SECTIONS and not block.is_camera_level
         ):
             stats["skipped"] += 1
             if verbose and block.config_keys:
@@ -114,9 +113,7 @@ def process_file(
             continue
 
         # Generate UI content
-        ui_content = generate_ui_content(
-            block, schema, i18n, section_configs
-        )
+        ui_content = generate_ui_content(block, schema, i18n, section_configs)
 
         if ui_content is None:
             stats["skipped"] += 1
@@ -130,17 +127,17 @@ def process_file(
         stats["generated"] += 1
 
         if inject:
-            full_block = wrap_with_config_tabs(
-                ui_content, block.raw, block.highlight
-            )
+            full_block = wrap_with_config_tabs(ui_content, block.raw, block.highlight)
             replacements.append((block.line_start, block.line_end, full_block))
         else:
             # Preview mode: print to stdout
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"File: {filepath}")
-            print(f"Line {block.line_start}: section={block.section_key}, "
-                  f"camera={block.is_camera_level}")
-            print(f"{'='*60}")
+            print(
+                f"Line {block.line_start}: section={block.section_key}, "
+                f"camera={block.is_camera_level}"
+            )
+            print(f"{'=' * 60}")
             print()
             print("--- Generated UI tab ---")
             print(ui_content)
@@ -233,9 +230,7 @@ def regenerate_file(
             continue
 
         # Generate fresh UI content
-        new_ui = generate_ui_content(
-            yaml_block, schema, i18n, section_configs
-        )
+        new_ui = generate_ui_content(yaml_block, schema, i18n, section_configs)
 
         if new_ui is None:
             stats["skipped"] += 1
@@ -251,25 +246,19 @@ def regenerate_file(
         if _normalize_whitespace(new_ui) == _normalize_whitespace(existing_ui):
             stats["unchanged"] += 1
             if verbose:
-                stats["warnings"].append(
-                    f"  Line {tab_block.line_start}: Unchanged"
-                )
+                stats["warnings"].append(f"  Line {tab_block.line_start}: Unchanged")
             continue
 
         stats["regenerated"] += 1
 
-        new_full = wrap_with_config_tabs(
-            new_ui, yaml_block.raw, yaml_block.highlight
-        )
-        replacements.append(
-            (tab_block.line_start, tab_block.line_end, new_full)
-        )
+        new_full = wrap_with_config_tabs(new_ui, yaml_block.raw, yaml_block.highlight)
+        replacements.append((tab_block.line_start, tab_block.line_end, new_full))
 
         if dry_run or verbose:
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"File: {filepath}, line {tab_block.line_start}")
             print(f"Section: {yaml_block.section_key}")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
             _print_diff(existing_ui, new_ui, filepath, tab_block.line_start)
 
     # Apply replacements
@@ -333,9 +322,7 @@ def check_file(
             stats["skipped"] += 1
             continue
 
-        new_ui = generate_ui_content(
-            yaml_block, schema, i18n, section_configs
-        )
+        new_ui = generate_ui_content(yaml_block, schema, i18n, section_configs)
 
         if new_ui is None:
             stats["skipped"] += 1
@@ -346,10 +333,10 @@ def check_file(
             stats["up_to_date"] += 1
         else:
             stats["drifted"] += 1
-            print(f"\n{'='*60}")
+            print(f"\n{'=' * 60}")
             print(f"DRIFT: {filepath}, line {tab_block.line_start}")
             print(f"Section: {yaml_block.section_key}")
-            print(f"{'='*60}")
+            print(f"{'=' * 60}")
             _print_diff(existing_ui, new_ui, filepath, tab_block.line_start)
 
     return stats
@@ -396,16 +383,14 @@ def _ensure_imports(content: str) -> str:
     lines = content.split("\n")
 
     needed_imports = []
-    if "<ConfigTabs>" in content and 'import ConfigTabs' not in content:
+    if "<ConfigTabs>" in content and "import ConfigTabs" not in content:
         needed_imports.append(
             'import ConfigTabs from "@site/src/components/ConfigTabs";'
         )
-    if "<TabItem" in content and 'import TabItem' not in content:
+    if "<TabItem" in content and "import TabItem" not in content:
         needed_imports.append('import TabItem from "@theme/TabItem";')
-    if "<NavPath" in content and 'import NavPath' not in content:
-        needed_imports.append(
-            'import NavPath from "@site/src/components/NavPath";'
-        )
+    if "<NavPath" in content and "import NavPath" not in content:
+        needed_imports.append('import NavPath from "@site/src/components/NavPath";')
 
     if not needed_imports:
         return content
@@ -468,7 +453,8 @@ def main():
         help="With --regenerate, show diffs but don't write files",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Show detailed warnings and diagnostics",
     )
@@ -528,13 +514,23 @@ def main():
         _run_check(files, schema, i18n, section_configs, args.verbose)
     elif args.regenerate:
         _run_regenerate(
-            files, schema, i18n, section_configs,
-            args.dry_run, args.verbose, file_outpaths,
+            files,
+            schema,
+            i18n,
+            section_configs,
+            args.dry_run,
+            args.verbose,
+            file_outpaths,
         )
     else:
         _run_inject(
-            files, schema, i18n, section_configs,
-            args.inject, args.verbose, file_outpaths,
+            files,
+            schema,
+            i18n,
+            section_configs,
+            args.inject,
+            args.verbose,
+            file_outpaths,
         )
 
     if outdir is not None:
@@ -554,14 +550,23 @@ def _run_inject(files, schema, i18n, section_configs, inject, verbose, file_outp
 
     for filepath in files:
         stats = process_file(
-            filepath, schema, i18n, section_configs,
-            inject=inject, verbose=verbose,
+            filepath,
+            schema,
+            i18n,
+            section_configs,
+            inject=inject,
+            verbose=verbose,
             outpath=file_outpaths.get(filepath),
         )
 
         total_stats["files"] += 1
-        for key in ["total_blocks", "config_blocks", "already_wrapped",
-                     "generated", "skipped"]:
+        for key in [
+            "total_blocks",
+            "config_blocks",
+            "already_wrapped",
+            "generated",
+            "skipped",
+        ]:
             total_stats[key] += stats[key]
 
         if verbose and stats["warnings"]:
@@ -580,7 +585,9 @@ def _run_inject(files, schema, i18n, section_configs, inject, verbose, file_outp
     print("=" * 60, file=sys.stderr)
 
 
-def _run_regenerate(files, schema, i18n, section_configs, dry_run, verbose, file_outpaths):
+def _run_regenerate(
+    files, schema, i18n, section_configs, dry_run, verbose, file_outpaths
+):
     """Run regenerate mode: update existing ConfigTabs blocks."""
     total_stats = {
         "files": 0,
@@ -592,8 +599,12 @@ def _run_regenerate(files, schema, i18n, section_configs, dry_run, verbose, file
 
     for filepath in files:
         stats = regenerate_file(
-            filepath, schema, i18n, section_configs,
-            dry_run=dry_run, verbose=verbose,
+            filepath,
+            schema,
+            i18n,
+            section_configs,
+            dry_run=dry_run,
+            verbose=verbose,
             outpath=file_outpaths.get(filepath),
         )
 
@@ -629,7 +640,11 @@ def _run_check(files, schema, i18n, section_configs, verbose):
 
     for filepath in files:
         stats = check_file(
-            filepath, schema, i18n, section_configs, verbose=verbose,
+            filepath,
+            schema,
+            i18n,
+            section_configs,
+            verbose=verbose,
         )
 
         total_stats["files"] += 1

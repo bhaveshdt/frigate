@@ -414,7 +414,15 @@ class RecordingMaintainer(threading.Thread):
 
             # see if the recording mover is too slow and segments need to be deleted
             if processed_segment_count > keep_count:
-                logger.warning(
+                camera_config = self.config.cameras.get(camera)
+                # a replay leaves every cached segment behind the most recent
+                # processed frame until the mover catches up, which is normal
+                log = (
+                    logger.debug
+                    if camera_config is not None and camera_config.detect_replay
+                    else logger.warning
+                )
+                log(
                     f"Unable to keep up with recording segments in cache for {camera}. Keeping the {keep_count} most recent segments out of {processed_segment_count} and discarding the rest..."
                 )
                 to_remove = grouped_recordings[key][:-keep_count]
@@ -649,10 +657,9 @@ class RecordingMaintainer(threading.Thread):
 
             # ensure duration is within expected length
             if 0 < duration < MAX_SEGMENT_DURATION:
-                # playback snaps mid-file entry points against these offsets
-                # instead of probing files on demand
-                async with self.probe_semaphore:
-                    keyframes = await get_keyframe_offsets(cache_path)
+                # keyframe offsets are only stored with kept recordings, so
+                # move_segment probes them, segments that get dropped never pay
+                keyframes = None
 
                 if previous_start is not None:
                     await previous_start.wait()
@@ -709,11 +716,10 @@ class RecordingMaintainer(threading.Thread):
         # retention decision below depends on complete stats for the segment.
         # A replayed segment is analyzed after it closes, and the last frame
         # picked from it can trail its end, so replay cameras get some slack
-        if (
-            datetime.datetime.fromtimestamp(
-                most_recently_processed_frame_time
-            ).astimezone(datetime.UTC)
-            < end_time - datetime.timedelta(seconds=self.replay_slack(camera))
+        if datetime.datetime.fromtimestamp(
+            most_recently_processed_frame_time
+        ).astimezone(datetime.UTC) < end_time - datetime.timedelta(
+            seconds=self.replay_slack(camera)
         ):
             return None
 
@@ -977,6 +983,12 @@ class RecordingMaintainer(threading.Thread):
         video_codec: str | None = None,
         keyframes: list[int] | None = None,
     ) -> dict[str, Any] | None:
+        # playback snaps mid-file entry points against these offsets instead
+        # of probing files on demand, probed here so only kept segments pay
+        if keyframes is None:
+            async with self.probe_semaphore:
+                keyframes = await get_keyframe_offsets(cache_path)
+
         path_time = segment_path_time(cache_path) or start_time
 
         # directory will be in utc due to path_time being in utc

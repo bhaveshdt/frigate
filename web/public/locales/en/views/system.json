@@ -318,6 +318,7 @@
       "fair": "Fair",
       "poor": "Poor",
       "unusable": "Unusable",
+      "replay": "Replay (no continuous stream)",
       "fps": "FPS",
       "expectedFps": "Expected FPS",
       "reconnectsLastHour": "Reconnects (last hour)",

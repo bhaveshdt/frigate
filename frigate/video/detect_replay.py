@@ -6,6 +6,11 @@ finished cache segments of the main stream, starting a little before the
 trigger and continuing until after it is released. Frames keep the time they
 were captured at.
 
+The replay is bounded by capture time, not by segment. It stops decoding at the
+end of the wanted range, and a cursor remembers how far the footage has been
+consumed, so a later trigger resumes inside a partly replayed segment instead
+of losing the footage that was not needed yet.
+
 The cache is cut with reset timestamps, so a frame's capture time is the start
 of its segment plus its presentation time in the file. ffmpeg reports that time
 for every frame it keeps (see CameraConfig.get_replay_ffmpeg_cmd), and it is
@@ -172,8 +177,11 @@ class DetectReplayRunner(threading.Thread):
         self._demand = False
         self._range_start = 0.0
         self._replay_until = 0.0
-        self._covered = 0.0
-        self._replayed: set[tuple[str, float]] = set()
+        # footage up to this time has been consumed, replay never goes back
+        self._cursor = 0.0
+        # capture time of the newest frame handed to the tracker, the tracker
+        # needs frames in order and must never see one twice
+        self._last_fed = 0.0
         self._process: Any = None
         self._read_started: float | None = None
         self._frame_index = 0
@@ -195,7 +203,7 @@ class DetectReplayRunner(threading.Thread):
         """A hardware event wants detection from just before now onwards."""
         with self._lock:
             if not self._demand:
-                if self._covered >= self._replay_until:
+                if self._cursor >= self._replay_until:
                     # nothing is pending, so this starts a new session
                     self._range_start = now - self.pre_roll
                 self._windows.open(now - self.pre_roll)
@@ -237,7 +245,7 @@ class DetectReplayRunner(threading.Thread):
 
     def _pending(self) -> bool:
         with self._lock:
-            return self._demand or self._covered < self._replay_until
+            return self._demand or self._cursor < self._replay_until
 
     def _detect_wanted(self, timestamp: float) -> bool:
         with self._lock:
@@ -263,20 +271,19 @@ class DetectReplayRunner(threading.Thread):
             now = time.time()
 
             with self._lock:
-                range_start = self._range_start
                 until = self._replay_until
-                self._replayed &= {(s.path, s.start) for s in segments}
+                # footage before the cursor was already consumed
+                start_from = max(self._range_start, self._cursor)
                 self._windows.prune(now - WINDOW_RETENTION_S)
 
             # every segment carries its own span, so gaps between segments
-            # neither stretch footage nor hide it
+            # neither stretch footage nor hide it. A segment is wanted while
+            # it holds footage between where replay stands and where it ends
             next_segment = next(
                 (
                     segment
                     for segment in segments
-                    if (segment.path, segment.start) not in self._replayed
-                    and segment.end > range_start
-                    and segment.start < until
+                    if segment.start < until and min(segment.end, until) > start_from
                 ),
                 None,
             )
@@ -285,11 +292,17 @@ class DetectReplayRunner(threading.Thread):
                 self._finish_if_caught_up(now, until)
                 return
 
-            self._replay_segment(next_segment)
+            try:
+                covered = self._replay_segment(next_segment)
+            except Exception:
+                # a segment that cannot be replayed must not be retried forever
+                logger.exception(
+                    "Replay of %s failed, skipping it", next_segment.path
+                )
+                covered = next_segment.end
 
             with self._lock:
-                self._replayed.add((next_segment.path, next_segment.start))
-                self._covered = max(self._covered, next_segment.end)
+                self._cursor = max(self._cursor, covered)
 
     def _finish_if_caught_up(self, now: float, until: float) -> None:
         """Stop waiting for footage that is never going to be finished."""
@@ -300,7 +313,7 @@ class DetectReplayRunner(threading.Thread):
             give_up_at = until + GIVE_UP_SEGMENTS * self.segment_time + GIVE_UP_MARGIN_S
 
             if now > give_up_at:
-                self._covered = max(self._covered, until)
+                self._cursor = max(self._cursor, until)
 
     def _start_process(self, cmd: list[str]) -> sp.Popen:
         return sp.Popen(
@@ -369,7 +382,8 @@ class DetectReplayRunner(threading.Thread):
 
         return return_code if return_code is not None else process.returncode
 
-    def _replay_segment(self, segment: CacheSegment) -> None:
+    def _replay_segment(self, segment: CacheSegment) -> float:
+        """Replay one segment and return the capture time it was consumed up to."""
         cmd = self.config.get_replay_ffmpeg_cmd(segment.path)
 
         if cmd is None:
@@ -382,10 +396,43 @@ class DetectReplayRunner(threading.Thread):
                 )
                 self._warned_no_source = True
 
-            return
+            return segment.end
 
+        frames, failed, covered = self._decode_segment(segment, cmd)
+
+        if failed and frames == 0 and not self._stopped():
+            # a hardware decoder that cannot read a segment should not cost the
+            # footage, so it is tried once more on the CPU. Nothing is retried
+            # after frames were handed over, they would be replayed twice
+            software_cmd = self.config.get_replay_ffmpeg_cmd(
+                segment.path, software=True
+            )
+
+            if software_cmd is not None and software_cmd != cmd:
+                logger.warning(
+                    "Hardware decode of %s failed, retrying it in software",
+                    segment.path,
+                )
+                _, _, covered = self._decode_segment(segment, software_cmd)
+
+        return covered
+
+    def _decode_segment(
+        self, segment: CacheSegment, cmd: list[str]
+    ) -> tuple[int, bool, float]:
+        """Decode a segment with one ffmpeg command.
+
+        Returns how many frames were handed to the tracker, whether ffmpeg
+        failed, and the capture time the segment was consumed up to.
+        """
         logger.debug("Replaying %s from %s", self.config.name, segment.path)
-        process = self._start_process(cmd)
+
+        try:
+            process = self._start_process(cmd)
+        except OSError:
+            logger.exception("Unable to start ffmpeg for %s", segment.path)
+            return 0, True, segment.end
+
         reader: FfmpegStderr | None = None
         done = threading.Event()
         self._process = process
@@ -395,6 +442,8 @@ class DetectReplayRunner(threading.Thread):
         untimed = 0
         ended = False
         truncated = False
+        trimmed = False
+        covered = segment.end
 
         # everything after the process exists is inside the try, so a failure
         # while setting up the helper threads cannot leave ffmpeg running
@@ -425,8 +474,25 @@ class DetectReplayRunner(threading.Thread):
                     untimed += 1
                     continue
 
-                if self._feed(data, frame_timestamp(segment, pts)):
+                timestamp = frame_timestamp(segment, pts)
+
+                with self._lock:
+                    until = self._replay_until
+
+                if timestamp > until:
+                    # the range ends inside this segment, the rest of it stays
+                    # unconsumed in case a later trigger wants it
+                    trimmed = True
+                    covered = until
+                    break
+
+                if timestamp <= self._last_fed:
+                    # already handed to the tracker by an earlier replay
+                    continue
+
+                if self._feed(data, timestamp):
                     frames += 1
+                    self._last_fed = timestamp
 
                 elapsed = time.time() - started
                 if elapsed > 0:
@@ -444,7 +510,7 @@ class DetectReplayRunner(threading.Thread):
             self.camera_fps.value = 0
 
         if self._stopped():
-            return
+            return frames, False, covered
 
         if untimed:
             logger.warning(
@@ -453,7 +519,11 @@ class DetectReplayRunner(threading.Thread):
                 segment.path,
             )
 
-        if return_code != 0 or truncated:
+        # ffmpeg that was stopped on purpose at the end of the range exits
+        # with a signal, that is not a failure
+        failed = not trimmed and (return_code != 0 or truncated)
+
+        if failed:
             logger.warning(
                 "Replay of %s ended early (exit code %s, %s frames): %s",
                 segment.path,
@@ -463,6 +533,8 @@ class DetectReplayRunner(threading.Thread):
             )
         elif frames == 0:
             logger.debug("No frames replayed from %s", segment.path)
+
+        return frames, failed, covered
 
     def _feed(self, data: bytes, timestamp: float) -> bool:
         """Hand one frame to the tracker, returns whether it was sent."""

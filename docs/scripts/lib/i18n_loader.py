@@ -38,22 +38,16 @@ def load_i18n() -> dict[str, Any]:
     config_form = settings.get("configForm", {})
 
     # FFmpeg preset labels (preset-vaapi → "VAAPI (Intel/AMD GPU)")
-    value_labels.update(
-        config_form.get("ffmpegArgs", {}).get("presetLabels", {})
-    )
+    value_labels.update(config_form.get("ffmpegArgs", {}).get("presetLabels", {}))
 
     # Timestamp position (tl → "Top left")
     value_labels.update(settings.get("timestampPosition", {}))
 
     # Input role options (detect → "Detect")
-    value_labels.update(
-        config_form.get("inputRoles", {}).get("options", {})
-    )
+    value_labels.update(config_form.get("inputRoles", {}).get("options", {}))
 
     # GenAI role options (vision → "Vision")
-    value_labels.update(
-        config_form.get("genaiRoles", {}).get("options", {})
-    )
+    value_labels.update(config_form.get("genaiRoles", {}).get("options", {}))
 
     result["value_labels"] = value_labels
 
