@@ -210,6 +210,8 @@ class RecordingMaintainer(threading.Thread):
         # whose DB seed found no rows
         self.last_segment_end: dict[tuple[str, str], float] = {}
         self.unexpected_cache_files_logged: bool = False
+        # newest start time reported valid without a probe, per (camera, stream)
+        self.unprobed_valid_time: dict[tuple[str, str], float] = {}
 
     def _get_last_segment_end(self, camera: str, stream_type: str) -> float | None:
         """Return the last known capture end time for a camera stream.
@@ -594,6 +596,61 @@ class RecordingMaintainer(threading.Thread):
         Path(cache_path).unlink(missing_ok=True)
         self.end_time_cache.pop(cache_path, None)
 
+    def _should_defer_probe(
+        self, camera: str, start_time: datetime.datetime, cache_path: str
+    ) -> bool:
+        """Whether a segment can wait for its probe until detection reaches it.
+
+        A replay camera has no detection between triggers, so every segment sits
+        in cache held, and the probe's only product is a hold that returns the
+        segment untouched. The probe runs once a processed frame is within
+        reach of the segment start, which is exactly when the hold could lift.
+        A missing or empty file is probed, so it is still caught as corrupt.
+        """
+        camera_config = self.config.cameras.get(camera)
+
+        if getattr(camera_config, "detect_replay", None) is not True:
+            return False
+
+        camera_info = self.object_recordings_info[camera]
+        latest_frame_time = camera_info[-1][0] if len(camera_info) > 0 else 0
+
+        # the filename start never trails the true start, so a segment whose
+        # filename start is beyond the latest frame is entirely unanalyzed
+        if latest_frame_time + self.replay_slack(camera) >= start_time.timestamp():
+            return False
+
+        try:
+            return os.path.getsize(cache_path) > 0
+        except OSError:
+            return False
+
+    def _publish_unprobed_valid(
+        self,
+        camera: str,
+        stream_type: str,
+        start_time: datetime.datetime,
+        cache_path: str,
+    ) -> None:
+        """Report an unprobed segment as valid so the record watchdog stays fed.
+
+        The watchdog restarts ffmpeg when no segment is reported valid for the
+        stale window. Only the newest start per stream is reported, which is
+        all the watchdog reads. Corruption goes unnoticed until a segment is
+        probed once detection reaches it.
+        """
+        key = (camera, stream_type)
+        timestamp = start_time.timestamp()
+
+        if timestamp <= self.unprobed_valid_time.get(key, 0.0):
+            return
+
+        self.unprobed_valid_time[key] = timestamp
+        self.recordings_publisher.publish(
+            (camera, stream_type, timestamp, cache_path),
+            RecordingsDataTypeEnum.valid.value,
+        )
+
     async def validate_and_move_segment(
         self,
         camera: str,
@@ -632,6 +689,12 @@ class RecordingMaintainer(threading.Thread):
             # filename timestamp
             start_time = end_time - datetime.timedelta(seconds=duration)
         else:
+            if self._should_defer_probe(camera, start_time, cache_path):
+                self._publish_unprobed_valid(
+                    camera, stream_type, start_time, cache_path
+                )
+                return None
+
             async with self.probe_semaphore:
                 segment_info = await get_video_properties(
                     self.config.ffmpeg, cache_path, get_duration=True

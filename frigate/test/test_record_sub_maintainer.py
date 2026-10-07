@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from playhouse.sqlite_ext import SqliteExtDatabase
 
+from frigate.comms.recordings_updater import RecordingsDataTypeEnum
 from frigate.config import FrigateConfig
 from frigate.models import Recordings
 from frigate.record.maintainer import (
@@ -828,9 +829,7 @@ class TestKeyframeProbeDeferral(unittest.IsolatedAsyncioTestCase):
                     "frigate.record.maintainer.asyncio.create_subprocess_exec",
                     AsyncMock(return_value=proc),
                 ),
-                patch(
-                    "frigate.record.maintainer.get_keyframe_offsets", keyframe_probe
-                ),
+                patch("frigate.record.maintainer.get_keyframe_offsets", keyframe_probe),
             ):
                 result = await RecordingMaintainer.move_segment(
                     maintainer,
@@ -861,3 +860,144 @@ class TestKeyframeProbeDeferral(unittest.IsolatedAsyncioTestCase):
 
         keyframe_probe.assert_not_awaited()
         self.assertEqual(result[Recordings.keyframes.name], [0, 1500])
+
+
+class TestReplayProbeDeferral(unittest.IsolatedAsyncioTestCase):
+    """A replay camera's segments are probed once detection reaches them."""
+
+    T0 = datetime.datetime(2026, 6, 10, 14, 30, 22, tzinfo=datetime.UTC).timestamp()
+
+    def _build(self, detect_replay: bool, frames: bool) -> RecordingMaintainer:
+        maintainer = _build_chaining_maintainer(self.T0)
+        maintainer.config.cameras["test_cam"].detect_replay = detect_replay
+        maintainer.unprobed_valid_time = {}
+
+        if not frames:
+            maintainer.object_recordings_info["test_cam"] = []
+
+        return maintainer
+
+    async def _validate(
+        self, maintainer: RecordingMaintainer, offset: float, cache_path: str
+    ) -> tuple[dict | None, AsyncMock]:
+        probe = AsyncMock(return_value={"has_valid_video": True, "duration": 10.0})
+
+        with patch("frigate.record.maintainer.get_video_properties", probe):
+            result = await maintainer.validate_and_move_segment(
+                "test_cam",
+                reviews=[],
+                recording={
+                    "start_time": datetime.datetime.fromtimestamp(
+                        self.T0 + offset, tz=datetime.UTC
+                    ),
+                    "cache_path": cache_path,
+                    "stream_type": "main",
+                },
+            )
+
+        return result, probe
+
+    def _published_topics(self, maintainer: RecordingMaintainer) -> list[str]:
+        return [
+            c.args[1] for c in maintainer.recordings_publisher.publish.call_args_list
+        ]
+
+    async def test_idle_replay_segment_skips_probe_and_reports_valid(self):
+        maintainer = self._build(detect_replay=True, frames=False)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = []
+            for name in ("a", "b"):
+                path = os.path.join(tmpdir, f"test_cam@{name}.mp4")
+                with open(path, "wb") as f:
+                    f.write(b"\x00" * 16)
+                paths.append(path)
+
+            result_a, probe_a = await self._validate(maintainer, 0, paths[0])
+            result_b, probe_b = await self._validate(maintainer, 10, paths[1])
+            # the same segment seen again on the next cycle must not republish
+            await self._validate(maintainer, 10, paths[1])
+
+        self.assertIsNone(result_a)
+        self.assertIsNone(result_b)
+        probe_a.assert_not_awaited()
+        probe_b.assert_not_awaited()
+        maintainer.drop_segment.assert_not_called()
+        maintainer.move_segment.assert_not_awaited()
+        self.assertEqual(maintainer.end_time_cache, {})
+        self.assertEqual(
+            self._published_topics(maintainer),
+            [RecordingsDataTypeEnum.valid.value] * 2,
+        )
+
+    async def test_replay_segment_probed_once_detection_reaches_it(self):
+        # a processed frame far past the segment, as after a replay
+        maintainer = self._build(detect_replay=True, frames=True)
+        cache_path = "/tmp/cache/test_cam@reached.mp4"
+
+        _, probe = await self._validate(maintainer, 0, cache_path)
+
+        probe.assert_awaited_once()
+        self.assertIn(cache_path, maintainer.end_time_cache)
+        maintainer.move_segment.assert_awaited_once()
+
+    async def test_segment_just_ahead_of_latest_frame_is_still_deferred(self):
+        maintainer = self._build(detect_replay=True, frames=False)
+        # latest frame is 5s before the segment start, beyond the 2s slack
+        maintainer.object_recordings_info["test_cam"] = [(self.T0 - 5, [], [], [])]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test_cam@ahead.mp4")
+            with open(path, "wb") as f:
+                f.write(b"\x00" * 16)
+
+            _, probe = await self._validate(maintainer, 0, path)
+
+        probe.assert_not_awaited()
+
+    async def test_segment_within_slack_of_latest_frame_is_probed(self):
+        maintainer = self._build(detect_replay=True, frames=False)
+        # latest frame is 1s before the segment start, inside the 2s slack
+        maintainer.object_recordings_info["test_cam"] = [(self.T0 - 1, [], [], [])]
+
+        _, probe = await self._validate(maintainer, 0, "/tmp/cache/test_cam@slack.mp4")
+
+        probe.assert_awaited_once()
+
+    async def test_non_replay_camera_is_probed_while_idle(self):
+        maintainer = self._build(detect_replay=False, frames=False)
+
+        _, probe = await self._validate(maintainer, 0, "/tmp/cache/test_cam@normal.mp4")
+
+        probe.assert_awaited_once()
+        self.assertEqual(
+            self._published_topics(maintainer), [RecordingsDataTypeEnum.valid.value]
+        )
+
+    async def test_empty_replay_segment_is_probed_and_discarded(self):
+        maintainer = self._build(detect_replay=True, frames=False)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "test_cam@empty.mp4")
+            open(path, "wb").close()
+
+            probe = AsyncMock(return_value={"has_valid_video": False})
+            with patch("frigate.record.maintainer.get_video_properties", probe):
+                result = await maintainer.validate_and_move_segment(
+                    "test_cam",
+                    reviews=[],
+                    recording={
+                        "start_time": datetime.datetime.fromtimestamp(
+                            self.T0, tz=datetime.UTC
+                        ),
+                        "cache_path": path,
+                        "stream_type": "main",
+                    },
+                )
+
+        self.assertIsNone(result)
+        probe.assert_awaited_once()
+        maintainer.drop_segment.assert_called_once_with(path)
+        self.assertEqual(
+            self._published_topics(maintainer), [RecordingsDataTypeEnum.invalid.value]
+        )
