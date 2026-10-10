@@ -37,6 +37,14 @@ type PreviewPlayerProps = {
   onControllerReady: (controller: PreviewController) => void;
   onClick?: () => void;
 };
+// a replay-mode camera only has preview frames while a replay is running, so
+// an empty preview is its normal idle state rather than something to flag
+function useIsReplayDetectCamera(camera: string): boolean {
+  const { data: config } = useSWR<FrigateConfig>("config");
+
+  return config?.cameras?.[camera]?.detect?.mode === "replay";
+}
+
 export default function PreviewPlayer({
   previewRef,
   className,
@@ -51,6 +59,7 @@ export default function PreviewPlayer({
 }: PreviewPlayerProps) {
   const { t } = useTranslation(["components/player"]);
   const [currentHourFrame, setCurrentHourFrame] = useState<string>();
+  const hideEmptyMessage = useIsReplayDetectCamera(camera);
   const currentPreview = usePreviewForTimeRange(
     cameraPreviews,
     camera,
@@ -98,7 +107,7 @@ export default function PreviewPlayer({
         className,
       )}
     >
-      {t("noPreviewFound")}
+      {!hideEmptyMessage && t("noPreviewFound")}
     </div>
   );
 }
@@ -137,6 +146,7 @@ function PreviewVideoPlayer({
   const { data: config } = useSWR<FrigateConfig>("config");
 
   const cameraName = useCameraFriendlyName(camera);
+  const hideEmptyMessage = useIsReplayDetectCamera(camera);
   // controlling playback
 
   const previewRef = useRef<HTMLVideoElement | null>(null);
@@ -327,7 +337,7 @@ function PreviewVideoPlayer({
           )}
         </video>
       )}
-      {cameraPreviews && !currentPreview && (
+      {cameraPreviews && !currentPreview && !hideEmptyMessage && (
         <div className="absolute inset-0 flex items-center justify-center rounded-lg bg-background_alt text-primary dark:bg-black md:rounded-2xl">
           {t("noPreviewFoundFor", { cameraName: cameraName })}
         </div>
@@ -452,6 +462,7 @@ function PreviewFramesPlayer({
   const { t } = useTranslation(["components/player"]);
 
   const cameraName = useCameraFriendlyName(camera);
+  const hideEmptyMessage = useIsReplayDetectCamera(camera);
   // frames data
 
   const { data: previewFrames } = useSWR<string[]>(
@@ -550,7 +561,7 @@ function PreviewFramesPlayer({
         loading="lazy"
         onLoad={onImageLoaded}
       />
-      {previewFrames?.length === 0 && (
+      {previewFrames?.length === 0 && !hideEmptyMessage && (
         <div className="-y-translate-1/2 align-center absolute inset-x-0 top-1/2 rounded-lg bg-background_alt text-center text-primary dark:bg-black md:rounded-2xl">
           {t("noPreviewFoundFor", { cameraName: cameraName })}
         </div>

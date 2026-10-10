@@ -96,6 +96,12 @@ export default function useStats(stats: FrigateStats | undefined) {
         return;
       }
 
+      // a detect_replay camera has no continuous frames while idle, so a
+      // camera_fps of zero is its normal state rather than an offline stream
+      if (cam["detect_replay"]) {
+        return;
+      }
+
       const cameraName = config.cameras?.[name]?.friendly_name ?? name;
       if (config.cameras?.[name]?.enabled && cam["camera_fps"] == 0) {
         problems.push(
