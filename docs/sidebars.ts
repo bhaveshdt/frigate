@@ -85,6 +85,7 @@ const sidebars: SidebarsConfig = {
           "configuration/record",
           "configuration/snapshots",
           "configuration/motion_detection",
+          "configuration/detect_replay",
           "configuration/birdseye",
           "configuration/live",
           "configuration/restream",

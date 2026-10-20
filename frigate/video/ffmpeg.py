@@ -12,6 +12,8 @@ from multiprocessing import Queue, Value
 from multiprocessing.synchronize import Event as MpEvent
 from typing import Any
 
+import psutil
+
 from frigate.camera import CameraMetrics
 from frigate.comms.inter_process import InterProcessRequestor
 from frigate.comms.recordings_updater import (
@@ -40,6 +42,7 @@ from frigate.util.image import (
     SharedMemoryFrameManager,
 )
 from frigate.util.process import FrigateProcess
+from frigate.video.detect_replay import DetectReplayRunner, ReplaySession
 
 logger = logging.getLogger(__name__)
 
@@ -151,10 +154,12 @@ class CameraWatchdog(threading.Thread):
         reconnects,
         detection_frame,
         stop_event,
+        replay_offline=None,
     ):
         threading.Thread.__init__(self)
         self.logger = logging.getLogger(f"watchdog.{config.name}")
         self.config = config
+        self.replay_offline = replay_offline
         self.shm_frame_count = shm_frame_count
         self.capture_thread = None
         self.ffmpeg_detect_process = None
@@ -179,13 +184,27 @@ class CameraWatchdog(threading.Thread):
             None,
             {config.name: config},
             [
+                CameraConfigUpdateEnum.detect,
                 CameraConfigUpdateEnum.enabled,
                 CameraConfigUpdateEnum.ffmpeg,
                 CameraConfigUpdateEnum.record,
             ],
+            on_detect_event=self._on_detect_event,
         )
         self.requestor = InterProcessRequestor()
         self.was_enabled = self.config.enabled
+        self.was_detect_replay = self.config.detect_replay
+        self.replay_runner: DetectReplayRunner | None = None
+        # (cursor, last fed capture time) of the last replay runner, so the
+        # next one never feeds the tracker a frame it already has
+        self._replay_progress: tuple[float, float] = (0.0, 0.0)
+        # the session the last runner left unfinished, for its replacement
+        self._replay_session: ReplaySession | None = None
+        # A runner that was asked to stop whose thread is still alive. It can
+        # still write frames, so no replacement starts until it has ended
+        self._retiring_replay: DetectReplayRunner | None = None
+        # whether the current outage of the replay thread was already reported
+        self._replay_down_logged = False
         self.was_record_enabled_in_config = self.config.record.enabled_in_config
         self.was_record_sub_enabled = self.config.record.sub.enabled
 
@@ -310,8 +329,28 @@ class CameraWatchdog(threading.Thread):
         self._check_config_updates()
         return self.config.enabled
 
+    def _on_detect_event(
+        self, camera: str, enabled: bool, event_time: float | None
+    ) -> None:
+        """Pass a detect toggle on to the replay runner.
+
+        In replay mode the toggle is the hardware event. Every toggle arrives
+        here in order, so one that flips back before the next watchdog tick is
+        still replayed, and each carries the time the event was received
+        rather than the time this loop got to it.
+        """
+        if camera != self.config.name or self.replay_runner is None:
+            return
+
+        timestamp = event_time if event_time is not None else time.time()
+
+        if enabled:
+            self.replay_runner.trigger(timestamp)
+        else:
+            self.replay_runner.release(timestamp)
+
     def reset_capture_thread(self, terminate: bool = True) -> None:
-        if terminate:
+        if terminate and self.ffmpeg_detect_process is not None:
             # The capture thread keeps draining stdout, so wait() is enough here.
             # communicate() would also buffer every frame ffmpeg writes before it
             # exits, which can be many duplicates after a stall.
@@ -436,6 +475,20 @@ class CameraWatchdog(threading.Thread):
             if not enabled:
                 continue
 
+            detect_replay = self.config.detect_replay
+            if detect_replay != self.was_detect_replay:
+                # the ffmpeg commands differ between the modes
+                self.logger.info(
+                    "Detect mode changed for %s, restarting ffmpeg processes",
+                    self.config.name,
+                )
+                self.stop_all_ffmpeg()
+                self.start_all_ffmpeg()
+                self._reset_segment_times()
+                self.record_enable_time = datetime.now().astimezone(UTC)
+                last_restart_time = datetime.now().timestamp()
+                continue
+
             while True:
                 update = self.segment_subscriber.check_for_update(timeout=0)
 
@@ -471,7 +524,11 @@ class CameraWatchdog(threading.Thread):
             time_since_last_restart = now - last_restart_time
             can_restart = time_since_last_restart >= self.sleeptime
 
-            if not self.capture_thread.is_alive():
+            if detect_replay:
+                # nothing decodes continuously, the replay thread is the supervised part
+                if self._check_replay(now, can_restart):
+                    last_restart_time = now
+            elif not self.capture_thread.is_alive():
                 self.detect_status.send("offline", now)
                 self.camera_fps.value = 0
                 self.logger.error(
@@ -600,7 +657,7 @@ class CameraWatchdog(threading.Thread):
             processed_ts = (
                 float(self.detection_frame.value) if self.detection_frame else 0.0
             )
-            if processed_ts > 0:
+            if processed_ts > 0 and self.capture_thread is not None:
                 delta = now - processed_ts
                 observed_fps = (
                     self.camera_fps.value
@@ -649,10 +706,167 @@ class CameraWatchdog(threading.Thread):
         )
         self.capture_thread.start()
 
+    def _cache_files_in_use(self, cache_dir: str) -> set[str]:
+        """Cache files this camera's own ffmpeg processes have open.
+
+        Replay uses this to tell a segment still being written from a finished
+        one. Asking only about this camera's processes avoids scanning every
+        process in the container, once a second, from inside the process that
+        also runs the tracker.
+        """
+        in_use: set[str] = set()
+
+        for entry in self.ffmpeg_other_processes[:]:
+            process = entry["process"]
+
+            if process is None:
+                continue
+
+            try:
+                for opened in psutil.Process(process.pid).open_files():
+                    if opened.path.startswith(cache_dir):
+                        in_use.add(opened.path)
+            except psutil.Error:
+                continue
+
+        return in_use
+
+    def _check_replay(self, now: float, can_restart: bool) -> bool:
+        """Supervise the replay thread, returns whether a restart was attempted.
+
+        A thread with nothing to do is idle and healthy. A dead one is reported
+        once per outage, not on every pass of the watchdog, and is started again
+        when the restart pacing allows. An attempt counts as a restart even when
+        start_replay declines because the previous thread has not ended, so the
+        retries stay paced.
+        """
+        runner = self.replay_runner
+
+        if runner is None or not runner.is_alive():
+            self.detect_status.send("idle", now)
+
+            if not self._replay_down_logged:
+                self._replay_down_logged = True
+                self.logger.error(
+                    "Replay thread is not running for %s", self.config.name
+                )
+
+            if not can_restart:
+                return False
+
+            self.start_replay()
+            return True
+
+        self._replay_down_logged = False
+
+        # with no detect stream to lose, a dead camera shows up as a recording
+        # stream that is down
+        record_offline = self.record_status[STREAM_TYPE_MAIN].last_status == "offline"
+
+        if record_offline:
+            self.detect_status.send("offline", now)
+        else:
+            self.detect_status.send("online" if runner.active else "idle", now)
+
+        if self.replay_offline is not None:
+            self.replay_offline.value = 1 if record_offline else 0
+
+        return False
+
+    def start_replay(self) -> bool:
+        """Start the thread that replays recorded footage for detection.
+
+        Returns False when the previous runner's thread is still alive. Two
+        runners must never write the same frame ring, and a stop that timed out
+        is not proof that the old thread ended, so the replacement waits.
+        """
+        previous = (
+            self._retiring_replay
+            if self._retiring_replay is not None
+            else self.replay_runner
+        )
+
+        if previous is not None:
+            if previous.is_alive():
+                self.logger.warning(
+                    "The previous replay thread for %s has not ended, not "
+                    "starting another",
+                    self.config.name,
+                )
+                return False
+
+            # a runner that ended is replaced from where it got to
+            self._replay_progress = previous.progress()
+            self._replay_session = previous.session()
+            self._retiring_replay = None
+
+        cursor, last_fed = self._replay_progress
+        self.replay_runner = DetectReplayRunner(
+            self.config,
+            self.shm_frame_count,
+            self.frame_queue,
+            self.camera_fps,
+            self.stop_event,
+            in_use=self._cache_files_in_use,
+            cursor=cursor,
+            last_fed=last_fed,
+        )
+        # a session that was not over when the last runner ended carries on, so
+        # a restart does not lose the frames that end the tracker's objects
+        session, self._replay_session = self._replay_session, None
+
+        if session is not None:
+            self.replay_runner.resume(session)
+
+        self.replay_runner.start()
+
+        if session is not None and session.demand and not self.config.detect.enabled:
+            # the release arrived while no runner was there to take it
+            released_at = self.config.detect.event_time
+            self.replay_runner.release(
+                released_at if released_at is not None else time.time()
+            )
+
+        # detection already enabled, such as from the config or a toggle that
+        # arrived while the runner was being restarted, is a standing trigger
+        if self.config.detect.enabled:
+            event_time = self.config.detect.event_time
+            self.replay_runner.trigger(
+                event_time if event_time is not None else time.time()
+            )
+
+        return True
+
+    def stop_replay(self) -> None:
+        runner = self.replay_runner
+
+        if runner is not None:
+            runner.stop()
+            # detect events no longer reach it
+            self.replay_runner = None
+
+            if runner.is_alive():
+                # a timeout is not proof that the thread ended. It may still
+                # write frames and change its progress, so its progress is not
+                # read and its replacement waits (see start_replay)
+                self.logger.warning(
+                    "Replay thread for %s did not stop in time", self.config.name
+                )
+                self._retiring_replay = runner
+            else:
+                self._replay_progress = runner.progress()
+                self._replay_session = runner.session()
+
+        self.camera_fps.value = 0
+
     def start_all_ffmpeg(self):
         """Start all ffmpeg processes (detection and others)."""
         logger.debug(f"Starting all ffmpeg processes for {self.config.name}")
-        self.start_ffmpeg_detect()
+        self.was_detect_replay = self.config.detect_replay
+        if self.config.detect_replay:
+            self.start_replay()
+        else:
+            self.start_ffmpeg_detect()
         for c in self.config.ffmpeg_cmds:
             if "detect" in c["roles"]:
                 continue
@@ -671,20 +885,39 @@ class CameraWatchdog(threading.Thread):
     def stop_all_ffmpeg(self):
         """Stop all ffmpeg processes (detection and others)."""
         logger.debug(f"Stopping all ffmpeg processes for {self.config.name}")
+        self.stop_replay()
+
+        if self.capture_thread is not None:
+            self.capture_thread.request_stop()
+
+        if self.ffmpeg_detect_process is not None:
+            stop_ffmpeg(self.ffmpeg_detect_process, self.logger)
+            self.ffmpeg_detect_process = None
+
         if self.capture_thread is not None and self.capture_thread.is_alive():
             self.capture_thread.join(timeout=5)
             if self.capture_thread.is_alive():
                 self.logger.warning(
                     f"Capture thread for {self.config.name} did not stop gracefully."
                 )
-        if self.ffmpeg_detect_process is not None:
-            stop_ffmpeg(self.ffmpeg_detect_process, self.logger)
-            self.ffmpeg_detect_process = None
+
+        self.capture_thread = None
         for p in self.ffmpeg_other_processes[:]:
             if p["process"] is not None:
                 stop_ffmpeg(p["process"], self.logger)
             p["logpipe"].close()
         self.ffmpeg_other_processes.clear()
+
+
+class _CombinedStopEvent:
+    """Stop flag that trips on either the global or a local stop event."""
+
+    def __init__(self, global_stop: MpEvent, local_stop: threading.Event) -> None:
+        self.global_stop = global_stop
+        self.local_stop = local_stop
+
+    def is_set(self) -> bool:
+        return self.global_stop.is_set() or self.local_stop.is_set()
 
 
 class CameraCaptureRunner(threading.Thread):
@@ -714,6 +947,11 @@ class CameraCaptureRunner(threading.Thread):
         self.ffmpeg_process = ffmpeg_process
         self.current_frame = Value("d", 0.0)
         self.last_frame = 0
+        self.local_stop = threading.Event()
+
+    def request_stop(self) -> None:
+        """Ask this capture thread to exit without touching the global stop."""
+        self.local_stop.set()
 
     def run(self):
         capture_frames(
@@ -727,7 +965,7 @@ class CameraCaptureRunner(threading.Thread):
             self.fps,
             self.skipped_fps,
             self.current_frame,
-            self.stop_event,
+            _CombinedStopEvent(self.stop_event, self.local_stop),
         )
 
 
@@ -764,6 +1002,7 @@ class CameraCapture(FrigateProcess):
             self.camera_metrics.reconnects_last_hour,
             self.camera_metrics.detection_frame,
             self.stop_event,
+            replay_offline=self.camera_metrics.replay_offline,
         )
         camera_watchdog.start()
         camera_watchdog.join()

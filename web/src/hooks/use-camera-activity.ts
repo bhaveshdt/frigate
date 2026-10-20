@@ -39,6 +39,15 @@ export function isCameraOffline(
     return false;
   }
 
+  // a replay camera has no continuous frames while idle, so a camera_fps of
+  // zero is its normal state. It is offline only when its recording stream is
+  if (stats.cameras[cameraName]?.detect_replay) {
+    return (
+      stats.cameras[cameraName]?.detect_replay_offline === true &&
+      stats.service.uptime > 60
+    );
+  }
+
   return (
     stats.cameras[cameraName]?.camera_fps == 0 && stats.service.uptime > 60
   );

@@ -210,6 +210,8 @@ class DebugReplayManager:
         detect_dict = source_config.detect.model_dump(
             exclude={"min_initialized", "max_disappeared", "enabled_in_config"}
         )
+        # the replay camera decodes a looping clip live and does not record
+        detect_dict["mode"] = "continuous"
 
         # Extract objects config, using .dict() on filters to convert
         # RuntimeFilterConfig ndarray masks back to string coordinates

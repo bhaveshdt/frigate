@@ -751,14 +751,15 @@ export function enrichmentRows({
 
 export type CameraConnectionCell = {
   camera: string;
-  quality: "excellent" | "fair" | "poor" | "unusable";
+  quality: "excellent" | "fair" | "poor" | "unusable" | "replay";
   cameraFps: number;
   expectedFps: number;
   reconnects: number;
   stalls: number;
 };
 
-/** enabled, non-replay cameras whose latest connection is not excellent */
+/** enabled, non-replay cameras whose latest connection is not excellent;
+ * a detect_replay camera has no continuous stream to rate, so it never counts */
 export function cameraConnectionCells(
   config: FrigateConfig,
   stats: FrigateStats | undefined,
@@ -774,7 +775,8 @@ export function cameraConnectionCells(
       if (
         !cam ||
         !cam.connection_quality ||
-        cam.connection_quality === "excellent"
+        cam.connection_quality === "excellent" ||
+        cam.connection_quality === "replay"
       ) {
         return undefined;
       }
