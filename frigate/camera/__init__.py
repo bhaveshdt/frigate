@@ -22,6 +22,9 @@ class CameraMetrics:
     ffmpeg_pid: ValueProxy[int]
     reconnects_last_hour: ValueProxy[int]
     stalls_last_hour: ValueProxy[int]
+    # 1 while a detect replay camera's recording stream is down, which is the
+    # only way such a camera can be offline: it has no detect stream to lose
+    replay_offline: ValueProxy[int]
 
     def __init__(self, manager: SyncManager):
         self.camera_fps = manager.Value("d", 0)
@@ -40,6 +43,7 @@ class CameraMetrics:
         self.ffmpeg_pid = manager.Value("i", 0)
         self.reconnects_last_hour = manager.Value("i", 0)
         self.stalls_last_hour = manager.Value("i", 0)
+        self.replay_offline = manager.Value("i", 0)
 
 
 class PTZMetrics:

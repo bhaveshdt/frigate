@@ -65,6 +65,11 @@ const detect: SectionConfigOverrides = {
           if (typeof width !== "number" || typeof height !== "number") {
             return false;
           }
+          // detection on a replay camera runs on demand against recorded
+          // segments, so a full-resolution detect size is intentional there
+          if (ctx.formData?.mode === "replay") {
+            return false;
+          }
           return Math.min(width, height) > 1080;
         },
       },

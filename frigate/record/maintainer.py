@@ -44,6 +44,7 @@ from frigate.models import Recordings, ReviewSegment
 from frigate.review.types import SeverityEnum
 from frigate.util.media import get_playback_index
 from frigate.util.ownership import chown_to_runtime
+from frigate.util.segment_time import measure_segment_start
 from frigate.util.services import get_video_properties
 
 logger = logging.getLogger(__name__)
@@ -62,6 +63,10 @@ SEGMENT_CHAIN_DRIFT_LIMIT_S = 0.5
 # processes, and the probes then blow their own timeouts together, so
 # segments get discarded as corrupt and the record watchdog restarts ffmpeg
 MAX_CONCURRENT_SEGMENT_PROBES = 4
+
+# a replayed segment counts as analyzed once a frame this close to its end has
+# been processed, the last selected frame can trail the end by a frame interval
+REPLAY_HOLD_SLACK_S = 2.0
 
 
 def parse_cache_segment_name(basename: str) -> tuple[str, str, str] | None:
@@ -179,7 +184,11 @@ class RecordingMaintainer(threading.Thread):
         self.config_subscriber = CameraConfigUpdateSubscriber(
             self.config,
             self.config.cameras,
-            [CameraConfigUpdateEnum.add, CameraConfigUpdateEnum.record],
+            [
+                CameraConfigUpdateEnum.add,
+                CameraConfigUpdateEnum.detect,
+                CameraConfigUpdateEnum.record,
+            ],
         )
         self.detection_subscriber = DetectionSubscriber(DetectionTypeEnum.all.value)
         self.recordings_publisher = RecordingsDataPublisher()
@@ -206,6 +215,8 @@ class RecordingMaintainer(threading.Thread):
         # whose DB seed found no rows
         self.last_segment_end: dict[tuple[str, str], float] = {}
         self.unexpected_cache_files_logged: bool = False
+        # newest start time reported valid without a probe, per (camera, stream)
+        self.unprobed_valid_time: dict[tuple[str, str], float] = {}
 
     def _get_last_segment_end(self, camera: str, stream_type: str) -> float | None:
         """Return the last known capture end time for a camera stream.
@@ -247,18 +258,13 @@ class RecordingMaintainer(threading.Thread):
         """
         filename_ts = filename_start.timestamp()
 
-        measured: float | None = None
         try:
             mtime = os.path.getmtime(cache_path)
         except OSError:
             mtime = None
-        if mtime is not None:
-            candidate = mtime - duration
-            # media shorter than its wall span (a stalled stream, an early
-            # close) derives a start past the truncation window, where the
-            # floored filename start is safer
-            if 0 <= candidate - filename_ts < SEGMENT_CHAIN_TOLERANCE_S:
-                measured = candidate
+
+        # shared with detect replay so both agree on when a segment started
+        measured = measure_segment_start(filename_ts, mtime, duration)
 
         last_end = self._get_last_segment_end(camera, stream_type)
 
@@ -415,7 +421,12 @@ class RecordingMaintainer(threading.Thread):
 
             # see if the recording mover is too slow and segments need to be deleted
             if processed_segment_count > keep_count:
-                logger.warning(
+                # a replay leaves every cached segment behind the most recent
+                # processed frame until the mover catches up, which is normal
+                # while idle. While detection is wanted it means replay is
+                # falling behind and footage is being lost, so that is loud
+                log = logger.debug if self._replay_idle(camera) else logger.warning
+                log(
                     f"Unable to keep up with recording segments in cache for {camera}. Keeping the {keep_count} most recent segments out of {processed_segment_count} and discarding the rest..."
                 )
                 to_remove = grouped_recordings[key][:-keep_count]
@@ -430,7 +441,10 @@ class RecordingMaintainer(threading.Thread):
                 len(grouped_recordings[key]) - processed_segment_count
             )
             if unprocessed_segment_count > keep_count:
-                logger.warning(
+                # replay mode has no detection between triggers, so an idle
+                # camera always has unprocessed segments in cache
+                log = logger.debug if self._replay_idle(camera) else logger.warning
+                log(
                     f"Too many unprocessed recording segments in cache for {camera}. This likely indicates an issue with the detect stream, keeping the {keep_count} most recent segments out of {unprocessed_segment_count} and discarding the rest..."
                 )
                 to_remove = grouped_recordings[key][:-keep_count]
@@ -587,6 +601,59 @@ class RecordingMaintainer(threading.Thread):
         Path(cache_path).unlink(missing_ok=True)
         self.end_time_cache.pop(cache_path, None)
 
+    def _should_defer_probe(
+        self, camera: str, start_time: datetime.datetime, cache_path: str
+    ) -> bool:
+        """Whether a segment can wait for its probe until detection reaches it.
+
+        A replay camera has no detection between triggers, so every segment sits
+        in cache held, and the probe's only product is a hold that returns the
+        segment untouched. The probe runs once a processed frame is within
+        reach of the segment start, which is exactly when the hold could lift.
+        A missing or empty file is probed, so it is still caught as corrupt.
+        """
+        if not self._is_replay(camera):
+            return False
+
+        camera_info = self.object_recordings_info[camera]
+        latest_frame_time = camera_info[-1][0] if len(camera_info) > 0 else 0
+
+        # the filename start never trails the true start, so a segment whose
+        # filename start is beyond the latest frame is entirely unanalyzed
+        if latest_frame_time + self.replay_slack(camera) >= start_time.timestamp():
+            return False
+
+        try:
+            return os.path.getsize(cache_path) > 0
+        except OSError:
+            return False
+
+    def _publish_unprobed_valid(
+        self,
+        camera: str,
+        stream_type: str,
+        start_time: datetime.datetime,
+        cache_path: str,
+    ) -> None:
+        """Report an unprobed segment as valid so the record watchdog stays fed.
+
+        The watchdog restarts ffmpeg when no segment is reported valid for the
+        stale window. Only the newest start per stream is reported, which is
+        all the watchdog reads. Corruption goes unnoticed until a segment is
+        probed once detection reaches it.
+        """
+        key = (camera, stream_type)
+        timestamp = start_time.timestamp()
+
+        if timestamp <= self.unprobed_valid_time.get(key, 0.0):
+            return
+
+        self.unprobed_valid_time[key] = timestamp
+        self.recordings_publisher.publish(
+            (camera, stream_type, timestamp, cache_path),
+            RecordingsDataTypeEnum.valid.value,
+        )
+
     async def validate_and_move_segment(
         self,
         camera: str,
@@ -626,6 +693,12 @@ class RecordingMaintainer(threading.Thread):
             # filename timestamp
             start_time = end_time - datetime.timedelta(seconds=duration)
         else:
+            if self._should_defer_probe(camera, start_time, cache_path):
+                self._publish_unprobed_valid(
+                    camera, stream_type, start_time, cache_path
+                )
+                return None
+
             async with self.probe_semaphore:
                 segment_info = await get_video_properties(
                     self.config.ffmpeg, cache_path, get_duration=True
@@ -652,9 +725,15 @@ class RecordingMaintainer(threading.Thread):
             # ensure duration is within expected length
             if 0 < duration < MAX_SEGMENT_DURATION:
                 # playback snaps mid-file entry points against these offsets
-                # instead of probing files on demand
-                async with self.probe_semaphore:
-                    keyframes, audio_duration = await get_playback_index(cache_path)
+                # instead of probing files on demand. Replay cameras defer the
+                # probe to move_segment so only kept segments pay for it, the
+                # other cameras keep probing here as before
+                keyframes = None
+                audio_duration = None
+
+                if not self._is_replay(camera):
+                    async with self.probe_semaphore:
+                        keyframes, audio_duration = await get_playback_index(cache_path)
 
                 if previous_start is not None:
                     await previous_start.wait()
@@ -709,12 +788,13 @@ class RecordingMaintainer(threading.Thread):
         )
 
         # ensure delayed segment info does not lead to lost segments, every
-        # retention decision below depends on complete stats for the segment
-        if (
-            datetime.datetime.fromtimestamp(
-                most_recently_processed_frame_time
-            ).astimezone(datetime.UTC)
-            < end_time
+        # retention decision below depends on complete stats for the segment.
+        # A replayed segment is analyzed after it closes, and the last frame
+        # picked from it can trail its end, so replay cameras get some slack
+        if datetime.datetime.fromtimestamp(
+            most_recently_processed_frame_time
+        ).astimezone(datetime.UTC) < end_time - datetime.timedelta(
+            seconds=self.replay_slack(camera)
         ):
             return None
 
@@ -839,6 +919,38 @@ class RecordingMaintainer(threading.Thread):
                 self.drop_segment(cache_path)
 
         return None
+
+    def replay_slack(self, camera: str) -> float:
+        """Seconds a segment's last processed frame may trail its end.
+
+        Replayed frames carry the time they were captured at and the last one
+        picked from a segment can fall a frame interval before its end, so a
+        replay camera's segment counts as analyzed slightly early. Cameras
+        that are not in replay mode get none.
+        """
+        if self._is_replay(camera):
+            return REPLAY_HOLD_SLACK_S
+
+        return 0.0
+
+    def _is_replay(self, camera: str) -> bool:
+        """Whether a camera runs detect mode replay."""
+        camera_config = self.config.cameras.get(camera)
+
+        return camera_config is not None and camera_config.detect_replay is True
+
+    def _replay_idle(self, camera: str) -> bool:
+        """Whether a replay camera is not being asked for detection right now.
+
+        An idle replay camera always has unanalyzed segments in cache, so a
+        backlog there is expected. While detection is wanted it is not.
+        """
+        camera_config = self.config.cameras.get(camera)
+
+        if camera_config is None or camera_config.detect_replay is not True:
+            return False
+
+        return camera_config.detect.enabled is not True
 
     def _compute_motion_heatmap(
         self, camera: str, motion_boxes: list[tuple[int, int, int, int]]
@@ -967,6 +1079,14 @@ class RecordingMaintainer(threading.Thread):
         keyframes: list[int] | None = None,
         audio_duration: float | None = None,
     ) -> dict[str, Any] | None:
+        # playback snaps mid-file entry points against these offsets instead
+        # of probing files on demand. Replay cameras defer the probe to here so
+        # only kept segments pay for it. Every other camera already probed
+        # before the move, and a failed probe is not repeated
+        if keyframes is None and self._is_replay(camera):
+            async with self.probe_semaphore:
+                keyframes, audio_duration = await get_playback_index(cache_path)
+
         path_time = segment_path_time(cache_path) or start_time
 
         # directory will be in utc due to path_time being in utc
